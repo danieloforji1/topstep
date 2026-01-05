@@ -1,0 +1,401 @@
+# Cursor Implementation Spec — Grid Strategy with Cross‑Asset Hedging (Python, TopstepX)
+
+**Author:** ChatGPT (for Daniel Oforji)
+**Target:** Cursor engineering team — production-ready build of an automated intraday grid strategy with cross-asset hedging, designed for futures trading (TopstepX). Demo environment: TopstepX practice account ($150k). Primary goal: moderate-aggressive performance tuned for Topstep $50k rules but flexible to higher capital.
+
+---
+
+## 1. Executive summary
+
+Build a production-grade Python service that runs an intraday volatility‑adaptive grid on a primary futures contract (chosen: **MES / MNQ pair as primary pair for indices** OR **MCL/CL for oil** — see Selection section). The system will:
+
+* Connect to TopstepX API for market data and order execution (practice/demo and production credentials supported).
+* Implement a volatility‑based grid (ATR-driven spacing), dynamic lot sizing (volatility & risk parity), and a cross‑asset hedging module using a correlated futures instrument available in the same Topstep account (no cross-exchange dependencies).
+* Provide real‑time safety controls aligning with Topstep rules (daily loss limit, trailing drawdown, in-session flatten, position caps).
+* Include logging, metrics, replayable strategy simulation, backtesting harness, and CI/CD deployment ready for Cursor.
+
+This document contains architecture, API integrations, module designs, config, pseudocode, acceptance tests, and a prioritized implementation backlog for Cursor engineers.
+
+---
+
+## 2. Project goals & constraints
+
+**Primary goals**
+
+* Achieve a moderate-aggressive daily target (configurable but baseline $400–$600/day on a $50k equivalent risk surface), while respecting Topstep evaluation limits: daily loss ≤ $1,000, trailing drawdown ≤ $2,000, and intra-session flattening.
+* Maintain high uptime, deterministic order behaviour, and reproducible simulations.
+
+**Hard constraints**
+
+* No overnight positions when running in Topstep evaluation mode — auto-flatten at session close.
+* Keep net intraday exposure capped (configurable default $1,200 notional equivalent).
+* All code in Python 3.11+; containerized (Docker); deployable to standard Cursor runtime.
+
+**Non-functional requirements**
+
+* Observability (logs, Prometheus metrics, Grafana dashboards).
+* Automated unit tests and integration tests against a simulated TopstepX sandbox or recorded market feed (VCR-style fixtures).
+* Secure storage for API keys (env vars or secrets manager) and safe defaults that disable live execution in dev.
+
+---
+
+## 3. Primary pair selection (recommended)
+
+**Recommendation:** Use **MES (Micro E-mini S&P 500)** as the primary instrument and **MNQ (Micro Nasdaq-100)** as the cross-asset hedge instrument for indices. Rationale:
+
+* Both are highly liquid, have tight spreads, and are available in TopstepX environment.
+* Strong positive correlation allows hedging to reduce net directional risk while staying within the same exchange/broker account (required for Topstep).
+* Micro contracts (MES/MNQ) allow fine-grained lot sizing and are friendly to Topstep position limits.
+
+**Alternative primary:** CL (Crude Oil) with MCL (micro crude) or RB/HO as hedges when focusing on energy. If user's emphasis is oil, swap pair accordingly.
+
+Configuration in the repo must allow swapping primary/hedge instruments easily.
+
+---
+
+## 4. High-level architecture
+
+**Components** (each is a separate Python module/service):
+
+1. **Connector Layer** (`connectors/`)
+
+   * `topstepx_client.py` — thin SDK wrapper for TopstepX REST & streaming (WS) endpoints: market data, order placement, order status, account/P&L queries.
+   * `market_data_adapter.py` — normalizes incoming ticks/candles to internal format.
+
+2. **Strategy Engine** (`strategy/`)
+
+   * `grid_manager.py` — maintains grid levels, places limit orders, tracks fills, reconciles book.
+   * `hedge_manager.py` — computes hedge ratios, places hedge orders in correlated instrument, and maintains hedge lifecycle.
+   * `position_manager.py` — tracks net positions, realized/unrealized P&L, and enforces exposure caps.
+   * `risk_manager.py` — enforces hard stops (daily loss guard, trailing drawdown guard, emergency flatten), and publishes alerts.
+   * `sizer.py` — volatility-based dynamic lot sizer (risk parity & volatility targeting).
+
+3. **Execution & Order Router** (`execution/`)
+
+   * `order_client.py` — atomic order submit/cancel/modify functions with retry logic and idempotency keys.
+   * `fill_handler.py` — reconciles fills, updates strategy state, and triggers post-fill actions (e.g., place hedges or ladder orders).
+
+4. **Data & Persistence Layer** (`data/`)
+
+   * `timeseries_store.py` — append-only candle & trade DB (sqlite for start, Postgres for prod). Support for parquet export.
+   * `trade_history.py` — store trade events, P&L history, grid state snapshots for replay.
+
+5. **Backtest & Replay** (`backtest/`)
+
+   * `simulator.py` — deterministic simulation engine with configurable slippage and fill models.
+   * `optimizer.py` — runs grid/hedge parameter sweeps and reports P&L/drawdown metrics.
+
+6. **API & Ops** (`api/ops.py`)
+
+   * HTTP endpoints for status, metrics, manual halt/flatten, and on-demand parameter changes (protected by auth).
+
+7. **Telemetry & Observability** (`observability/`)
+
+   * Metrics exporter (Prometheus): P&L, running exposure, open orders count, realized/unrealized P&L, daily drawdown.
+   * Alerts (Slack/Discord + PagerDuty integration optional)
+
+8. **Deployment & CI**
+
+   * Dockerfile, k8s manifest templates, GitHub Actions for CI (unit tests, flake8, mypy, build image).
+
+---
+
+## 5. TopstepX API integration & account behaviors
+
+**Authentication & keys**
+
+* Use secure env vars (`TOPSTEPX_API_KEY`, `TOPSTEPX_API_SECRET`). Do not hardcode. Use Cursor secret manager.
+
+**Market data**
+
+* Prefer websocket tick feed for low latency fills. Fall back to REST candlesticks for historical ATR/vol calculations.
+
+**Order model**
+
+* Use limit orders for grid legs. Market orders allowed only for emergency flatten or stop execution.
+* Maintain idempotency keys. Implement a pending-order db to reconcile restarts.
+
+**Account queries**
+
+* Regularly poll account balances and intraday P&L (1–2s cadence) to enforce Topstep daily/total loss guard.
+
+**Sandbox behavior**
+
+* Create a `--dry-run` flag that simulates orders without touching live API. This must be default off in dev.
+
+**Rate limits & retries**
+
+* Implement exponential backoff for 429s, and safe retries for network errors. Add circuit-breaker if API is unresponsive.
+
+---
+
+## 6. Strategy details & pseudocode
+
+### 6.1 Core strategy params (defaults for moderate-aggressive)
+
+```yaml
+primary_instrument: MES
+hedge_instrument: MNQ
+capital_equiv: 150000  # practice account
+target_daily_PL: 500   # baseline, adjustable
+max_daily_loss: 900    # safety (Topstep has 1000) - leave buffer
+trailing_drawdown_limit: 1800
+grid_levels_each_side: 5
+atr_window: 14         # ATR on 15m candles by default
+atr_multiplier_for_spacing: 0.45  # tighter for aggressive
+profit_ticks_per_leg: 0.5 * atr_points
+hedge_activation_multiplier: 1.5  # mult of spacing to start hedging
+volatility_window: 100  # for sizer and corr calc
+sizer_R_per_trade: 150  # $ risk per new base lot
+max_net_notional: 1200  # in $ equivalent to cap exposure
+recalc_interval_seconds: 60  # recalc ATR/hedge every minute
+```
+
+### 6.2 Top-level operation flow (runtime)
+
+1. On start, load config, connect to TopstepX (market data + order endpoints), and warm up historical candles (min `max(atr_window, volatility_window)` periods).
+2. Compute ATR, spacing = `atr * atr_multiplier_for_spacing`.
+3. Generate grid levels around initial `grid_mid` (session VWAP or user midpoint). Place passive limit orders for both buy/sell sides in primary instrument sized via `sizer`.
+4. On fills: update `position_manager`. For net exposure beyond `hedge_activation_threshold` (e.g., price has moved 1.5× spacing beyond the grid midpoint), compute hedge ratio via `hedge_manager` and open hedge position(s) using `hedge_instrument` sized by volatility-adjusted ratio.
+5. Continuously evaluate `risk_manager` for daily P&L triggers or exposure cap. If a stop is hit, cancel all orders and flatten immediately.
+6. Close all positions and cancel orders before session end (configurable safety margin 5m).
+
+### 6.3 Pseudocode — main loop
+
+```python
+while trading_session_open():
+    tick = market_data.get_next()
+    timeseries.append(tick)
+
+    if time_to_recalc():
+        atr = indicators.atr(timeseries, atr_window)
+        spacing = atr * config.atr_multiplier_for_spacing
+        sizer.update_volatility(timeseries)
+        hedge_manager.update_correlation(timeseries)
+        grid_manager.rebuild_grid_if_mid_shifted()
+
+    fills = order_client.fetch_fills()
+    for fill in fills:
+        position_manager.on_fill(fill)
+        # when net exposure exceeds threshold, trigger hedging
+        if position_manager.net_exposure_dollars() > config.hedge_trigger_notional:
+            hedge_amount = hedge_manager.compute_hedge_size(position_manager)
+            order_client.place_limit(hedge_instrument, side='SELL', size=hedge_amount, price=...)
+
+    # battery of risk checks
+    if risk_manager.daily_loss_exceeded() or risk_manager.trailing_drawdown_exceeded():
+        order_client.cancel_all()
+        position_manager.flatten_all()
+        alert('Hard stop triggered - flattened')
+        break
+
+    sleep(poll_interval)
+```
+
+### 6.4 Hedge sizing algorithm (risk parity + correlation)
+
+* Let `σ_p` = vol of primary, `σ_h` = vol of hedge, `ρ` = rolling correlation (window = `volatility_window`).
+* Hedge ratio `h = ρ * (σ_p / σ_h)`.
+* If `position_manager` reports `n_primary` lots long, `hedge_lots = n_primary * h` (rounded to micro contract granularity) and direction opposite primary.
+* Limit min/max hedge scale (e.g., 0.5–1.25) for stability and to avoid over-hedging on noisy corr estimates.
+
+### 6.5 Lot sizer (volatility-adjusted R risk)
+
+* Calculate dollar volatility per contract: `dollar_vol_per_contract = ATR_points * tick_value`.
+* Desired risk-per-base-lot `R` (configurable) => `base_lot = R / dollar_vol_per_contract`.
+* Ensure base_lot is clamped to allowed contract sizes (micro contract min step = 1 contract unit) and exposure caps.
+* For pyramiding layers: `lot_n = base_lot * (1 + α*n)` with `α` small (0.2–0.3).
+
+---
+
+## 7. Safety & compliance rules (Topstep-ready)
+
+**Hard stop rules (enforced in risk_manager):**
+
+* `if daily_loss_realized >= max_daily_loss: immediate_flatten_and_disable_live_trading`
+* `if trailing_drawdown_since_peak >= trailing_drawdown_limit: pause & notify`
+* `if net_exposure_notional >= max_net_notional: do not open new grid legs or hedge further`
+* `if time_now >= session_close - safety_margin: cancel orders & flatten`
+
+**Soft protections:**
+
+* Volatility surge detector: if ATR increases > X% in timeframe, reduce lot sizes and widen spacing automatically.
+* Correlation unsticking: if rolling correlation drops under threshold (e.g., 0.6) for >Y minutes, reduce hedge size by 50% and notify.
+
+**Operational constraints**
+
+* Manual kill switch via API and dashboard. Must default to off for automated live trading until a human enables it.
+
+---
+
+## 8. Testing & validation plan
+
+**Unit tests**
+
+* Indicator correctness (ATR, rolling vol, correlation).
+* Sizer arithmetic and clamps.
+* Order idempotency and retry behaviours (mock TopstepX).
+
+**Integration tests**
+
+* Simulate orders against a replayed market day with deterministic fills; assert drawdown, P&L, and exit behavior.
+* Test edge cases: API disconnect, partial fills, slippage models.
+
+**Backtests / Walk-forward**
+
+* Parameter sweep for `atr_multiplier_for_spacing`, `R`, `hedge_activation_multiplier`, `α` (pyramiding). Record Sharpe, max drawdown, trade frequency.
+* Walk-forward resampling: re-estimate ATR/corr windows on rolling partitions and measure OOS performance.
+
+**Live-sim validation**
+
+* Run on TopstepX practice account ($150k) for 30+ demo sessions. Track per-session stats: P&L, max intraday drawdown, number of baskets, execution slippage.
+
+**Acceptance criteria before production**
+
+* Pass unit & integration tests in CI.
+* Demo: at least 30 sessions with average daily P&L within ±20% of target and zero hard stop triggers (daily loss exceeded) in the last 15 sessions.
+
+---
+
+## 9. Deployment & operations
+
+**Dev -> Prod pipeline**
+
+* PRs run unit tests, lints, and build container.
+* Merge to `main` triggers build of Docker image and push to registry.
+* `deploy/prod` job runs smoke tests (dry-run) then updates Cursor runtime config with new image.
+
+**Runbook (on-call)**
+
+* Commands: `curl /ops/flatten` to force flatten; `curl /ops/status` to check run status; `curl /ops/pause` to pause strategy.
+* Common alerts: High slippage, API disconnect >30s, daily_loss > 75% of max loss.
+
+**Monitoring**
+
+* Grafana dashboard with: real-time P&L, daily drawdown, open orders, net exposure, ATR, hedge ratio, correlation.
+
+---
+
+## 10. Deliverables & File Layout (repo)
+
+```
+cursor-grid-hedge/
+├─ Dockerfile
+├─ README.md
+├─ src/
+│  ├─ connectors/topstepx_client.py
+│  ├─ strategy/grid_manager.py
+│  ├─ strategy/hedge_manager.py
+│  ├─ strategy/sizer.py
+│  ├─ execution/order_client.py
+│  ├─ data/timeseries_store.py
+│  ├─ backtest/simulator.py
+│  └─ api/ops.py
+├─ tests/
+├─ ci/
+├─ k8s/
+└─ docs/
+```
+
+---
+
+## 11. Implementation backlog (priority ordered, 2-week sprint chunks)
+
+**Sprint 0 — Foundations (1 week)**
+
+* Project scaffolding, Dockerfile, linting, pre-commit.
+* Connector stub for TopstepX with mock server.
+* Timeseries store and basic indicators (ATR, rolling vol, corr).
+
+**Sprint 1 — Core strategy engine (2 weeks)**
+
+* Implement `grid_manager`, `position_manager`, and `sizer` with unit tests.
+* Simple order_client with dry-run mode.
+* Basic risk_manager checks (daily loss guard, net exposure cap).
+
+**Sprint 2 — Hedging & execution (2 weeks)**
+
+* Implement `hedge_manager` with correlation-based sizing.
+* Fill handling and reconciliation logic.
+* Integration tests with replayed market data.
+
+**Sprint 3 — Backtest & optimization (2 weeks)**
+
+* Implement simulator and optimizer. Run parameter sweeps.
+* Create a report of recommended parameter set for demo runs.
+
+**Sprint 4 — Live-sim & hardening (2 weeks)**
+
+* Deploy to TopstepX practice account. Run 30-session validation.
+* Add observability, alerting, and deployment automation.
+
+**Sprint 5 — Production rollout (1 week)**
+
+* Final hardening, secrets, and go-live checklist. Enable live trading behind human toggle.
+
+---
+
+## 12. Example code snippets (for engineers)
+
+**ATR spacing & grid generation**
+
+```python
+from collections import namedtuple
+Level = namedtuple('Level', ['price', 'side', 'size'])
+
+def generate_grid(mid_price, atr_points, k, levels_each_side, tick_size, base_lot):
+    spacing = atr_points * k
+    levels = []
+    for i in range(1, levels_each_side+1):
+        p_up = mid_price + spacing * i
+        p_dn = mid_price - spacing * i
+        levels.append(Level(price=round_to_tick(p_dn, tick_size), side='BUY', size=base_lot))
+        levels.append(Level(price=round_to_tick(p_up, tick_size), side='SELL', size=base_lot))
+    return sorted(levels, key=lambda l: l.price)
+```
+
+**Hedge ratio compute**
+
+```python
+def compute_hedge_ratio(vol_primary, vol_hedge, corr, min_h=0.5, max_h=1.25):
+    if vol_hedge <= 0: return 1.0
+    h = corr * (vol_primary / vol_hedge)
+    return max(min_h, min(max_h, h))
+```
+
+**Volatility-based lot sizer**
+
+```python
+def compute_base_lot(R_dollars, atr_points, tick_value):
+    dollar_vol_per_contract = atr_points * tick_value
+    if dollar_vol_per_contract <= 0:
+        return 1
+    lot = R_dollars / dollar_vol_per_contract
+    return max(1, int(round(lot)))  # use micro contract integer granularity
+```
+
+---
+
+## 13. Acceptance & handoff checklist for Cursor
+
+* [ ] Repo scaffolded and built image runs with `--dry-run` producing expected outputs.
+* [ ] All unit tests pass in CI and coverage ≥ 85% for strategy modules.
+* [ ] Integration test with replayed day shows risk-manager enforcement and no hard stops across 10 demo days.
+* [ ] Observability: Grafana dashboard created and target metrics emitted.
+* [ ] Operations: runbook and manual kill-switch validated.
+
+---
+
+## 14. Next steps (recommended)
+
+1. Approve the spec and provision TopstepX practice credentials in Cursor secrets vault.
+2. Cursor team starts Sprint 0 tasks and provides a short (3–5 day) plan for first incremental demo.
+3. After Sprint 1, run an internal demo in dry-run mode and iterate on parameters.
+
+---
+
+If you want, I can also produce a **ready-to-import Python package scaffold** (file tree and starter code) that Cursor can immediately `git clone` and begin implementing. Indicate "generate scaffold" and I will produce the code files.
+
+---
+
+*End of spec.*

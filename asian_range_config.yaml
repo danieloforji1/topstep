@@ -1,0 +1,39 @@
+# Asian Range Breakout Strategy Configuration
+# MGC Gold Futures Trading System
+
+# Trading Instrument
+instrument: MGC
+
+# Strategy Parameters
+contracts_per_trade: 5        # Fixed number of contracts per trade
+tp_multiplier: 1.5            # Take profit multiplier (1.0 to 2.0x Asian range size)
+sl_buffer_ticks: 1           # Stop loss buffer in ticks (places SL further from range to avoid wicks)
+partial_close_percent: 0.75   # Percentage to close at 12 PM (0.75 = 75%, remaining 25% stays open)
+
+# Strategy Time Windows (ET timezone)
+# Asian Session: 8:00 PM - 2:00 AM ET (range calculation)
+# London Open: 3:00 AM ET (order placement)
+# NY Close: 12:00 PM ET (partial close)
+# End of Day: 5:00 PM ET (hard exit)
+
+# Risk Management
+max_daily_loss: 900           # Maximum daily loss (Topstep has 1000) - leave buffer
+trailing_drawdown_limit: 1800  # Maximum trailing drawdown
+max_net_notional: 5000        # Maximum net exposure in dollars
+
+# TopstepX API Configuration
+api_base_url: https://api.topstepx.com
+user_hub_url: https://rtc.topstepx.com/hubs/user
+market_hub_url: https://rtc.topstepx.com/hubs/market
+
+# Observability
+metrics_port: 8001             # Different port from grid strategy (8000)
+log_level: INFO
+
+# Trading Mode
+dry_run: true                  # Set to false for live trading (requires explicit enable)
+
+# Account Selection
+prefer_practice_account: true  # Prefer practice/simulated accounts over live
+account_id: null               # Optional: specify account ID directly (overrides auto-selection)
+

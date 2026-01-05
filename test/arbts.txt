@@ -1,0 +1,276 @@
+# **Asian Range Breakout Strategy for Gold (MGC) – Detailed Technical Specification Document**
+
+## **Version:** 1.0
+
+## **Prepared For:** Futures Trading using MGC via TopStepX Data
+
+## **Asset:** Micro Gold Futures (MGC)
+
+## **Goal:** Build, test, and validate the Asian Range Breakout Strategy specifically for MGC using TopStep data for the current year.
+
+---
+
+# **1. Introduction**
+
+Gold exhibits highly predictable session-based volatility behavior. The **Asian Range Breakout Strategy** takes advantage of the consistent low-volatility consolidation period during the Asian session and the explosive volatility expansion during the London and New York sessions.
+
+This document provides:
+
+* Full behavioral analysis of gold and why the strategy works
+* Exact strategy rules (entries, exits, risk, filters)
+* A step-by-step engineering plan to build the backtester
+* A blueprint for pulling historical MGC data from TopStepX API
+* Data cleaning and preprocessing procedures
+* Backtesting logic and statistical evaluation methodology
+* A technical plan for future live trading integration
+
+All logic follows the strategy description **exactly as originally defined**, with no deviations.
+
+---
+
+# **2. Why This Strategy Works (Market Microstructure Explanation)**
+
+### **2.1 Asian Session Behavior (8 PM – 2 AM ET)**
+
+* Low liquidity
+* Low volatility
+* Minimal institutional activity
+* Price consolidates into a narrow and stable range
+* This creates a **liquidity box**, where both retail and institutional orders accumulate
+
+Large liquidity builds up:
+
+* Above Asian range high (buy stops)
+* Below Asian range low (sell stops)
+
+This builds **stored potential energy**.
+
+### **2.2 London Open (3 AM ET)**
+
+* European banks and bullion desks come online
+* Liquidity jumps dramatically
+* A predictable volatility expansion begins
+* Price seeks liquidity → breakout from the Asian box
+
+### **2.3 New York Session (8:30 AM – 12 PM ET)**
+
+* COMEX opens → largest gold futures volume in the world
+* Gold tends to continue the initial breakout direction
+* Liquidity is strong and clean until around 12 PM ET
+
+---
+
+# **3. Strategy Rules (Strict and Unmodified)**
+
+## **3.1 Time Windows**
+
+* **Asian Session Range:** 8:00 PM – 2:00 AM ET
+* **London Open Trigger:** 3:00 AM ET
+* **NY Close for Strategy Exit:** 12:00 PM ET
+
+---
+
+# **3.2 Asian Range Construction (Core Component)**
+
+Between 8 PM and 2 AM ET:
+
+* Track all high and low prices
+* At 2 AM, freeze the **Asian High** and **Asian Low**
+
+We now have a full **range box**.
+
+---
+
+# **3.3 Pending Orders at 3:00 AM ET (London Open)**
+
+Place two OCO (one-cancels-other) orders:
+
+### **Buy Stop:**
+
+* Price = Asian High + 1 minimum tick
+
+### **Sell Stop:**
+
+* Price = Asian Low − 1 minimum tick
+
+-
+
+Only one of these should trigger.
+*
+
+---
+
+# **3.4 Position Management**
+
+### **Stop Loss (SL):**
+
+Opposite side of the Asian Range:
+
+* Long trade → stop below Asian Low
+* Short trade → stop above Asian High
+
+### **Take Profit (TP):**
+
+1× to 2× Asian Range size
+
+* Range = Asian High − Asian Low
+* TP = Entry + (1R to 2R move)
+
+### **Break-Even Rule:**
+
+When trade reaches **+1R profit**:
+
+* Move the stop loss to break-even
+
+### **Hard Exit Time:**
+
+If TP not hit before **12 PM ET**, exit immediately.
+
+---
+
+# **4. Engineering Plan – Building the System**
+
+This section outlines exactly how to build the codebase to test the strategy.
+
+---
+
+# **4.1 Data Acquisition (TopStepX)**
+
+### **4.1.1 Required Data Fields**
+
+To backtest for the year, we must obtain MGC data containing:
+
+* Timestamp (in ET)
+* Open
+* High
+* Low
+* Close
+* Volume
+
+### **4.1.2 Data Frequency**
+
+For accuracy: **1-minute bars**
+
+Lower timeframes (e.g., tick) can be used later, but 1-minute is sufficient for this strategy.
+
+### **4.1.3 API Retrieval Steps**
+
+* Authenticate using TopStepX API key
+* Define symbol = `MGC`
+* Define date range = Jan 1 → today
+* Specify interval = 1-minute
+* Retrieve all bars sequentially
+* Store raw data in `parquet` or compressed JSON
+
+### **4.1.4 Timezone Handling**
+
+TopStep timestamps may be UTC → convert to **ET**.
+
+---
+
+# **4.2 Data Cleaning**
+
+Processing steps:
+
+1. Remove any duplicate timestamps
+2. Forward-fill missing minute bars if needed
+3. Convert to ET timezone
+4. Ensure full continuity from 8 PM to 12 PM each day
+5. Validate:
+
+   * High ≥ max(Open, Close)
+   * Low ≤ min(Open, Close)
+   * No negative prices
+
+---
+
+# **4.3 Backtesting Architecture**
+
+Structure:
+
+### **4.3.1 Daily Loop**
+
+For each trading day:
+
+1. Extract data from 8 PM previous day → 12 PM current day
+2. Build the Asian Range
+3. At 3 AM create pending orders
+4. Simulate order fills
+5. Manage position (SL, BE, TP)
+6. Exit at 12 PM ET if still open
+
+---
+
+# **4.3.2 Order Simulation Rules**
+
+Stop entry logic:
+
+* If price trades through stop level, mark entry at stop price
+
+Stop loss logic:
+
+* Triggered when low/high crosses SL
+
+TP logic:
+
+* Triggered when high/low crosses TP
+
+Break-even logic:
+
+* Once the trade reaches +1R, modify SL = entry price
+
+---
+
+# **4.4 Performance Metrics**
+
+Track:
+
+* Win rate
+* Average R per trade
+* Max drawdown
+* Long-side vs short-side performance
+* Average Asian range size
+* Profit factor
+* Sharpe ratio (optional)
+* Expectancy per trade
+
+---
+
+# **5. Final Output of Backtest**
+
+The results should include:
+
+* Year-to-date (YTD) equity curve
+* Trade list with timestamps
+* Summary statistics
+* Distribution of daily ranges
+* Number of trades taken
+* Distribution of winners and losers
+* Percentage of days with breakout
+
+For visual confirmation:
+
+* Plot Asian range boxes each day
+* Mark breakout entries
+* Mark hit of TP, SL, or BE
+
+---
+
+# **6. Future Live Trading Plan**
+
+The same logic will be ported to a real-time engine using:
+
+* Streaming MGC data
+* Automated range calculation
+* Order placement at 3 AM
+* Automatic break-even adjustment
+* Automatic close at 12 PM
+* Discord alert integration
+
+---
+
+# **7. Conclusion**
+
+This document provides a fully specified, production-grade design for building the Asian Range Breakout Strategy for MGC futures. It is engineered to be 1:1 faithful to the strategy rules described earlier, ensures data accuracy, enforces proper risk management, and creates a foundation for both backtesting and eventual live integration with the TopStep environment.
+
+Next step (upon your instruction): implement the full Python backtester and provide the results for this year so far.

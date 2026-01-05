@@ -1,0 +1,44 @@
+================================================================================
+STATISTICAL ARBITRAGE STRATEGY BACKTEST RESULTS
+================================================================================
+
+STRATEGY PARAMETERS:
+  Z-Entry Threshold: ±2.0
+  Z-Exit Threshold: 0.6
+  Spread Stop: 3.0 std deviations
+  Time Stop: 2.0 hours
+
+PERFORMANCE SUMMARY:
+  Total Trades: 112
+  Winning Trades: 112
+  Losing Trades: 0
+  Win Rate: 100.00%
+
+PROFIT & LOSS:
+  Total PnL: $45,300.00
+  Gross Profit: $45,300.00
+  Gross Loss: $0.00
+  Profit Factor: 0.00
+  Average PnL per Trade: $404.46
+  Expectancy: $404.46
+
+EQUITY CURVE:
+  Initial Equity: $10,000.00
+  Final Equity: $55,300.00
+  Total Return: 453.00%
+  Maximum Drawdown: 0.00%
+
+TRADE STATISTICS:
+  Average Duration: 1.4 minutes
+  Exit Reasons:
+    Z_EXIT: 70 (62.5%)
+    ZERO_CROSS: 42 (37.5%)
+
+  Long Spread Trades: 64
+    Total PnL: $24,630.00
+    Win Rate: 100.0%
+  Short Spread Trades: 48
+    Total PnL: $20,670.00
+    Win Rate: 100.0%
+
+================================================================================

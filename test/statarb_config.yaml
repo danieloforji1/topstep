@@ -1,0 +1,39 @@
+# Statistical Arbitrage Strategy Backtest Configuration
+# Cross-Asset Statistical Arbitrage: MGC ↔ GC (Micro Gold ↔ Full Gold)
+
+# Date Range
+start_date: "2025-11-11"
+end_date: "2025-11-13"
+
+# Data Settings
+interval: "1m"  # Bar interval: "1m", "5m", etc.
+use_cached_data: false  # Use cached data if available
+cache_dir: "test/cache"
+output_dir: "test/results"
+
+# Strategy Parameters
+z_entry: 2.0  # Z-score entry threshold (±2.0 means enter when |z| > 2.0)
+z_exit: 0.6  # Z-score exit threshold (exit when |z| < 0.6)
+
+# Risk Management
+spread_stop_std: 3.0  # Stop loss in standard deviations of spread
+time_stop_hours: 2.0  # Maximum hold time in hours (30 min - 2 hours)
+risk_per_trade: 100.0  # Dollar amount to risk per trade (0.5-1.0% of account)
+
+# Backtest Settings
+initial_equity: 10000.0  # Starting capital
+lookback_periods: 1440  # Rolling window for mean/std calculation (1 day of 1-min bars)
+min_lookback: 100  # Minimum periods needed before generating signals
+beta_lookback: 500  # Periods for beta (hedge ratio) calculation
+
+# Trading Pair
+instrument_a: "GC"  # Full Gold Futures
+instrument_b: "MGC"  # Micro Gold Futures
+
+# Notes:
+# - Entry: When z-score exceeds ±z_entry (spread deviates from mean)
+# - Exit: When z-score falls below z_exit (spread reverts to mean)
+# - Stop Loss: Spread moves against position by spread_stop_std standard deviations
+# - Time Stop: Force exit after time_stop_hours regardless of z-score
+# - Beta: Hedge ratio calculated dynamically using linear regression
+

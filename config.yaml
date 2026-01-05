@@ -1,0 +1,68 @@
+# Grid Strategy Configuration - Topstep 50k Challenge
+# TopstepX Trading System
+# 
+# Challenge Requirements:
+# - Profit Target: $3,000
+# - Daily Loss Limit: $1,000
+# - Trailing Drawdown Limit: $2,000 (from highest balance)
+# - Max Position Size: 5 contracts simultaneously
+# - Consistency: Best day cannot exceed 50% of total profits
+
+# Trading Instruments
+primary_instrument: MES
+hedge_instrument: MNQ
+capital_equiv: 50000  # 50k challenge starting capital
+target_daily_PL: 300  # Conservative daily target (reach $3k in ~10 days)
+max_daily_loss: 900    # Safety buffer below $1,000 limit
+trailing_drawdown_limit: 1800  # Safety buffer below $2,000 limit
+
+# Grid Parameters
+grid_levels_each_side: 3  # Reduced from 5 to respect 5-contract limit
+atr_window: 14         # ATR on 15m candles by default
+atr_multiplier_for_spacing: 0.35  # Slightly wider spacing for challenge (less aggressive)
+profit_ticks_per_leg: 0.40  # multiplier of atr_points
+hedge_activation_multiplier: 1.5  # Slightly higher threshold for hedging
+
+# Volatility & Sizing
+volatility_window: 100  # for sizer and corr calc
+sizer_R_per_trade: 100  # Reduced risk per trade ($100 vs $150) for challenge safety
+max_net_notional: 800  # Reduced exposure cap to respect 5-contract limit
+max_position_size: 5    # Hard limit: 5 contracts max (challenge requirement)
+
+# Timing
+recalc_interval_seconds: 60  # Slightly less frequent recalc for challenge
+session_close_safety_margin_minutes: 10  # More conservative margin (challenge safety)
+
+# TopstepX API Configuration
+api_base_url: https://api.topstepx.com
+user_hub_url: https://rtc.topstepx.com/hubs/user
+market_hub_url: https://rtc.topstepx.com/hubs/market
+
+# Risk Management
+hedge_ratio_min: 0.4   # Lower minimum for challenge (less aggressive)
+hedge_ratio_max: 1.0    # Lower maximum for challenge (safer)
+correlation_threshold: 0.65  # Higher threshold (more conservative)
+max_hedge_contracts_multiplier: 0.5  # Conservative hedge sizing (50% of primary max)
+
+# Consistency Target (challenge requirement)
+# Best day cannot exceed 50% of total profits
+# If total profit = $3,000, best day max = $1,500
+consistency_max_daily_profit_pct: 0.50  # 50% of total profit target
+consistency_enabled: true
+
+# Observability
+metrics_port: 8000
+log_level: INFO
+
+# Trading Mode - CRITICAL: Set to false for live challenge account
+dry_run: false  # MUST be false for live challenge trading
+
+# Account Selection - CRITICAL: Set to false to use LIVE challenge account
+prefer_practice_account: false  # MUST be false for 50k challenge
+account_id: null  # Optional: specify your 50k challenge account ID directly
+
+# Challenge-Specific Safety Features
+enable_consistency_check: true  # Monitor best day vs total profit
+enable_position_size_limit: true  # Enforce 5-contract maximum
+enable_aggressive_risk_checks: true  # More frequent risk monitoring
+
