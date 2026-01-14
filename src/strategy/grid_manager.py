@@ -23,43 +23,116 @@ class GridOrder:
 
 
 class GridManager:
-    """Manages grid levels and orders"""
+    """Manages grid levels and orders with adaptive density and multi-timeframe alignment"""
     
     def __init__(
         self,
         symbol: str,
         levels_each_side: int = 5,
         tick_size: float = 0.25,
-        state_persistence: Optional[Any] = None
+        state_persistence: Optional[Any] = None,
+        # Enhanced features
+        adaptive_density: bool = True,
+        base_levels_each_side: int = 5,
+        min_levels_each_side: int = 3,
+        max_levels_each_side: int = 8,
+        order_flow_analyzer: Optional[Any] = None,
+        multi_timeframe_analyzer: Optional[Any] = None
     ):
         self.symbol = symbol
         self.levels_each_side = levels_each_side
+        self.base_levels_each_side = base_levels_each_side
+        self.min_levels_each_side = min_levels_each_side
+        self.max_levels_each_side = max_levels_each_side
+        self.adaptive_density = adaptive_density
         self.tick_size = tick_size
         self.state_persistence = state_persistence  # StatePersistence instance
+        self.order_flow_analyzer = order_flow_analyzer
+        self.multi_timeframe_analyzer = multi_timeframe_analyzer
         
         self.grid_mid: Optional[float] = None
         self.spacing: Optional[float] = None
         self.levels: List[Level] = []
         self.orders: Dict[float, GridOrder] = {}  # price -> GridOrder
         self.filled_levels: set = set()
+        
+        # Track volatility history for adaptive density
+        self.volatility_history: List[float] = []
     
     def round_to_tick(self, price: float) -> float:
         """Round price to nearest tick"""
         return round(price / self.tick_size) * self.tick_size
     
+    def calculate_adaptive_levels(self, volatility: Optional[float], volatility_percentile: Optional[float] = None) -> int:
+        """
+        Calculate adaptive number of levels based on volatility regime
+        
+        Args:
+            volatility: Current volatility (ATR or std dev)
+            volatility_percentile: Volatility percentile (0-1), if None will calculate from history
+        
+        Returns:
+            Number of levels each side
+        """
+        if not self.adaptive_density:
+            return self.base_levels_each_side
+        
+        # Calculate volatility percentile if not provided
+        if volatility_percentile is None:
+            if volatility is not None:
+                self.volatility_history.append(volatility)
+                # Keep last 100 readings
+                if len(self.volatility_history) > 100:
+                    self.volatility_history = self.volatility_history[-100:]
+            
+            if len(self.volatility_history) < 20:
+                # Not enough data, use base
+                return self.base_levels_each_side
+            
+            # Calculate percentile
+            sorted_vol = sorted(self.volatility_history)
+            if volatility is not None:
+                percentile = sum(1 for v in sorted_vol if v < volatility) / len(sorted_vol)
+            else:
+                percentile = 0.5  # Default to median
+        else:
+            percentile = volatility_percentile
+        
+        # Adaptive logic:
+        # High volatility (high percentile) -> fewer, wider-spaced levels
+        # Low volatility (low percentile) -> more, tighter-spaced levels
+        # Formula: levels = base - (percentile - 0.5) * range
+        
+        range_size = self.max_levels_each_side - self.min_levels_each_side
+        adjustment = (percentile - 0.5) * range_size * 2  # Scale adjustment
+        
+        adaptive_levels = int(round(self.base_levels_each_side - adjustment))
+        adaptive_levels = max(self.min_levels_each_side, min(self.max_levels_each_side, adaptive_levels))
+        
+        logger.debug(
+            f"Adaptive levels: {adaptive_levels} (percentile: {percentile:.2f}, "
+            f"base: {self.base_levels_each_side})"
+        )
+        
+        return adaptive_levels
+    
     def generate_grid(
         self,
         mid_price: float,
         spacing: float,
-        base_lot: int
+        base_lot: int,
+        volatility: Optional[float] = None,
+        volatility_percentile: Optional[float] = None
     ) -> List[Level]:
         """
-        Generate grid levels around midpoint
+        Generate grid levels around midpoint with adaptive density and alignment
         
         Args:
             mid_price: Center price for grid
             spacing: Distance between levels (in price points)
             base_lot: Base lot size for orders
+            volatility: Current volatility for adaptive density
+            volatility_percentile: Volatility percentile (0-1) for adaptive density
         """
         # Don't clear existing orders when regenerating grid - preserve them
         # Only clear if grid_mid is None (first time)
@@ -67,36 +140,71 @@ class GridManager:
             self.orders = {}
             self.filled_levels = set()
         
-        self.grid_mid = mid_price
+        # Apply order flow adjustment to grid midpoint
+        adjusted_mid = mid_price
+        if self.order_flow_analyzer:
+            flow_adjustment = self.order_flow_analyzer.get_grid_mid_adjustment(mid_price)
+            adjusted_mid = mid_price + flow_adjustment
+            logger.debug(f"Order flow adjusted mid: {adjusted_mid:.2f} (adjustment: {flow_adjustment:.2f})")
+        
+        # Apply multi-timeframe alignment
+        if self.multi_timeframe_analyzer:
+            aligned_mid = self.multi_timeframe_analyzer.should_align_grid_to_level(adjusted_mid)
+            if aligned_mid is not None:
+                adjusted_mid = aligned_mid
+                logger.info(f"MTF aligned grid mid: {adjusted_mid:.2f}")
+        
+        self.grid_mid = adjusted_mid
         self.spacing = spacing
+        
+        # Calculate adaptive levels
+        if self.adaptive_density:
+            self.levels_each_side = self.calculate_adaptive_levels(volatility, volatility_percentile)
         
         levels = []
         
         # Generate levels on each side
         for i in range(1, self.levels_each_side + 1):
             # Buy levels (below mid)
-            buy_price = self.round_to_tick(mid_price - spacing * i)
-            levels.append(Level(
-                price=buy_price,
-                side='BUY',
-                size=base_lot,
-                level_index=-i
-            ))
+            buy_price = self.round_to_tick(adjusted_mid - spacing * i)
+            
+            # Check if we should avoid this level (low volume zone)
+            should_avoid = False
+            if self.order_flow_analyzer:
+                should_avoid = self.order_flow_analyzer.should_avoid_price_level(buy_price)
+            
+            if not should_avoid:
+                levels.append(Level(
+                    price=buy_price,
+                    side='BUY',
+                    size=base_lot,
+                    level_index=-i
+                ))
             
             # Sell levels (above mid)
-            sell_price = self.round_to_tick(mid_price + spacing * i)
-            levels.append(Level(
-                price=sell_price,
-                side='SELL',
-                size=base_lot,
-                level_index=i
-            ))
+            sell_price = self.round_to_tick(adjusted_mid + spacing * i)
+            
+            # Check if we should avoid this level (low volume zone)
+            should_avoid = False
+            if self.order_flow_analyzer:
+                should_avoid = self.order_flow_analyzer.should_avoid_price_level(sell_price)
+            
+            if not should_avoid:
+                levels.append(Level(
+                    price=sell_price,
+                    side='SELL',
+                    size=base_lot,
+                    level_index=i
+                ))
         
         # Sort by price
         levels.sort(key=lambda l: l.price)
         
         self.levels = levels
-        logger.info(f"Generated grid: {len(levels)} levels around ${mid_price:.2f}, spacing=${spacing:.2f}")
+        logger.info(
+            f"Generated grid: {len(levels)} levels around ${adjusted_mid:.2f}, "
+            f"spacing=${spacing:.2f}, levels_each_side={self.levels_each_side}"
+        )
         
         return levels
     
@@ -105,7 +213,9 @@ class GridManager:
         current_price: float,
         spacing: float,
         base_lot: int,
-        threshold: float = 0.5
+        threshold: float = 0.5,
+        volatility: Optional[float] = None,
+        volatility_percentile: Optional[float] = None
     ) -> bool:
         """
         Rebuild grid if price has moved significantly
@@ -113,22 +223,35 @@ class GridManager:
         Args:
             current_price: Current market price
             spacing: Current grid spacing
+            base_lot: Base lot size
             threshold: Fraction of spacing to trigger rebuild (0.5 = rebuild if price moved 50% of spacing)
+            volatility: Current volatility for adaptive density
+            volatility_percentile: Volatility percentile for adaptive density
         
         Returns:
             True if grid was rebuilt
         """
         if self.grid_mid is None:
-            self.generate_grid(current_price, spacing, base_lot)
+            self.generate_grid(current_price, spacing, base_lot, volatility, volatility_percentile)
             return True
         
         # Check if price has moved beyond threshold
         price_move = abs(current_price - self.grid_mid)
         move_threshold = spacing * threshold
         
-        if price_move > move_threshold:
-            logger.info(f"Price moved {price_move:.2f} from grid mid, rebuilding grid")
-            self.generate_grid(current_price, spacing, base_lot)
+        # Also check if adaptive density changed significantly
+        density_changed = False
+        if self.adaptive_density:
+            new_levels = self.calculate_adaptive_levels(volatility, volatility_percentile)
+            if abs(new_levels - self.levels_each_side) >= 2:  # Significant change
+                density_changed = True
+        
+        if price_move > move_threshold or density_changed:
+            logger.info(
+                f"Rebuilding grid: price_move={price_move:.2f} (threshold={move_threshold:.2f}), "
+                f"density_changed={density_changed}"
+            )
+            self.generate_grid(current_price, spacing, base_lot, volatility, volatility_percentile)
             return True
         
         return False

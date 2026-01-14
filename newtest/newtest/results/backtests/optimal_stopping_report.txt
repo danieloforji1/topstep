@@ -1,0 +1,48 @@
+================================================================================
+COMPREHENSIVE BACKTEST REPORT: OPTIMAL_STOPPING
+================================================================================
+
+PERFORMANCE SUMMARY
+--------------------------------------------------------------------------------
+Initial Equity: $50,000.00
+Final Equity: $54,385.00
+Total Return: 8.77%
+Annualized Return: 1527.19%
+Total P&L: $4,385.00
+
+RISK METRICS
+--------------------------------------------------------------------------------
+Sharpe Ratio: 0.72
+Sortino Ratio: 0.94
+Calmar Ratio: 427.27
+Maximum Drawdown: 3.57% ($1,860.00)
+
+TRADE STATISTICS
+--------------------------------------------------------------------------------
+Total Trades: 22
+Winning Trades: 13 (59.09%)
+Losing Trades: 9 (40.91%)
+Profit Factor: 2.03
+Expectancy: $201.82 per trade
+
+TRADE ANALYSIS
+--------------------------------------------------------------------------------
+Average Win: $673.65
+Average Loss: $-479.72
+Largest Win: $1367.50
+Largest Loss: $-702.50
+
+MONTHLY PERFORMANCE
+--------------------------------------------------------------------------------
+2025-12: $4,440.00
+
+DRAWDOWN ANALYSIS
+--------------------------------------------------------------------------------
+Maximum Drawdown: -3.57%
+Average Drawdown: -0.99%
+Number of Drawdown Periods: 0
+
+CONSISTENCY METRICS
+--------------------------------------------------------------------------------
+Consistency Score: 39.76
+Average Daily Return: $493.33

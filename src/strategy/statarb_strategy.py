@@ -8,7 +8,7 @@ import time
 import logging
 import yaml
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from threading import Lock
@@ -117,6 +117,7 @@ class StatArbStrategy:
         self.time_stop_hours = self.config.get('time_stop_hours', 2.0)
         self.risk_per_trade = self.config.get('risk_per_trade', 100.0)
         self.recalc_interval = timedelta(seconds=self.config.get('recalc_interval_seconds', 30))
+        self.spread_divergence_hours = self.config.get('spread_divergence_hours', 4.0)
         
         # Execution
         self.order_client = OrderClient(self.api_client, dry_run=self.dry_run)
@@ -129,12 +130,16 @@ class StatArbStrategy:
         self.current_price_a: Optional[float] = None  # GC price
         self.current_price_b: Optional[float] = None  # MGC price
         self.current_position: Optional[StatArbPosition] = None
-        self.last_recalc_time = datetime.now()
+        self.last_recalc_time = datetime.now(timezone.utc)
         self.data_lock = Lock()  # Thread-safe access to price data
         
         # Historical data for calculations (pandas DataFrames)
         self.df_gc: Optional[pd.DataFrame] = None
         self.df_mgc: Optional[pd.DataFrame] = None
+        
+        # Spread divergence tracking
+        self.extreme_spread_start_time: Optional[datetime] = None  # When spread first became extreme
+        self.last_extreme_direction: Optional[str] = None  # "LONG" or "SHORT" or None
         
         logger.info(f"StatArb Strategy initialized (dry_run={self.dry_run})")
         if not self.dry_run:
@@ -497,12 +502,60 @@ class StatArbStrategy:
         
         # Calculate number of GC contracts
         contracts_gc = max(1, int(self.risk_per_trade / total_risk))
-        contracts_gc = min(contracts_gc, 10)  # Cap at 10
+        contracts_gc = min(contracts_gc, 2)  # Cap at 2 (reduced from 10 for risk management)
         
         # Hedge with MGC: 1 GC contract = 10 MGC contracts
         contracts_mgc = max(1, contracts_gc * 10)
         
         return contracts_gc, contracts_mgc
+    
+    def _check_spread_divergence(self, signal: SpreadSignal) -> bool:
+        """
+        Check if spread has been extreme for too long (divergence filter)
+        Returns True if entry should be blocked due to divergence
+        """
+        now = datetime.now(timezone.utc)
+        current_direction = "LONG" if signal.signal == "LONG_SPREAD" else "SHORT"
+        
+        # Check if spread is currently extreme (z-score exceeds entry threshold)
+        is_extreme = abs(signal.zscore) >= self.calculator.z_entry
+        
+        if is_extreme:
+            # If this is a new extreme direction or continuation of same direction
+            if self.last_extreme_direction != current_direction:
+                # New extreme direction - reset timer
+                self.extreme_spread_start_time = now
+                self.last_extreme_direction = current_direction
+                logger.debug(f"Spread became extreme ({current_direction}), starting divergence timer")
+                return False  # Allow entry, just started being extreme
+            elif self.extreme_spread_start_time is not None:
+                # Same direction, check duration
+                duration_hours = (now - self.extreme_spread_start_time).total_seconds() / 3600.0
+                if duration_hours >= self.spread_divergence_hours:
+                    logger.warning(
+                        f"BLOCKING ENTRY: Spread has been extreme ({current_direction}) "
+                        f"for {duration_hours:.2f} hours (limit: {self.spread_divergence_hours} hours). "
+                        f"Z-score: {signal.zscore:.2f}"
+                    )
+                    return True  # Block entry - spread has diverged too long
+                else:
+                    logger.debug(
+                        f"Spread extreme for {duration_hours:.2f} hours "
+                        f"(limit: {self.spread_divergence_hours} hours) - allowing entry"
+                    )
+                    return False  # Still within limit
+            else:
+                # First time tracking - start timer
+                self.extreme_spread_start_time = now
+                self.last_extreme_direction = current_direction
+                return False
+        else:
+            # Spread is not extreme - reset tracking
+            if self.extreme_spread_start_time is not None:
+                logger.debug("Spread returned to normal range, resetting divergence timer")
+            self.extreme_spread_start_time = None
+            self.last_extreme_direction = None
+            return False  # Not extreme, no blocking needed
     
     def _enter_spread_position(self, signal: SpreadSignal) -> bool:
         """Enter a spread position (both legs simultaneously)"""
@@ -553,9 +606,19 @@ class StatArbStrategy:
         )
         
         if order_id_gc and order_id_mgc:
-            # Create position
+            # Create position - ensure timezone-aware datetime
+            if hasattr(signal.timestamp, 'to_pydatetime'):
+                entry_time = signal.timestamp.to_pydatetime()
+                # If timezone-aware, convert to UTC; if naive, assume UTC
+                if entry_time.tzinfo is None:
+                    entry_time = entry_time.replace(tzinfo=timezone.utc)
+                else:
+                    entry_time = entry_time.astimezone(timezone.utc)
+            else:
+                entry_time = datetime.now(timezone.utc)
+            
             self.current_position = StatArbPosition(
-                entry_time=signal.timestamp.to_pydatetime() if hasattr(signal.timestamp, 'to_pydatetime') else datetime.now(),
+                entry_time=entry_time,
                 entry_price_gc=order_price_gc,
                 entry_price_mgc=order_price_mgc,
                 entry_spread=signal.spread,
@@ -637,8 +700,16 @@ class StatArbStrategy:
         
         pos = self.current_position
         
-        # Check time stop
-        duration = (datetime.now() - pos.entry_time).total_seconds() / 3600
+        # Check time stop - ensure both datetimes are timezone-aware
+        now = datetime.now(timezone.utc)
+        entry_time = pos.entry_time
+        # If entry_time is naive, assume UTC; if aware, ensure UTC
+        if entry_time.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=timezone.utc)
+        else:
+            entry_time = entry_time.astimezone(timezone.utc)
+        
+        duration = (now - entry_time).total_seconds() / 3600
         if duration >= self.time_stop_hours:
             return True, "TIME_STOP"
         
@@ -701,7 +772,7 @@ class StatArbStrategy:
         # Get recent orders to check for fills
         recent_orders = self.api_client.get_orders(
             self.api_client.account_id,
-            start_timestamp=datetime.now() - timedelta(hours=1)
+            start_timestamp=datetime.now(timezone.utc) - timedelta(hours=1)
         )
         
         for order in recent_orders:
@@ -738,9 +809,10 @@ class StatArbStrategy:
             return
         
         # Update historical data periodically
-        if datetime.now() - self.last_recalc_time > self.recalc_interval:
+        now = datetime.now(timezone.utc)
+        if now - self.last_recalc_time > self.recalc_interval:
             self._update_historical_data()
-            self.last_recalc_time = datetime.now()
+            self.last_recalc_time = now
         
         # Need both prices and sufficient data
         with self.data_lock:
@@ -787,6 +859,13 @@ class StatArbStrategy:
         
         # Handle entry signals (only if no position)
         if signal.is_entry and not self.current_position:
+            # Check spread divergence filter before entering
+            if self._check_spread_divergence(signal):
+                logger.info(
+                    f"Entry blocked by divergence filter: z={signal.zscore:.2f}, "
+                    f"signal={signal.signal}"
+                )
+                return  # Skip entry if divergence filter blocks it
             self._enter_spread_position(signal)
         
         # Monitor position for exits
@@ -794,8 +873,10 @@ class StatArbStrategy:
             should_exit, exit_reason = self._check_exit_conditions()
             if should_exit:
                 self._exit_spread_position(exit_reason)
-                # Clear position after exit
+                # Clear position after exit and reset divergence tracking
                 self.current_position = None
+                self.extreme_spread_start_time = None
+                self.last_extreme_direction = None
     
     def _update_risk_checks(self) -> bool:
         """Update risk checks and return True if should stop"""
@@ -871,7 +952,7 @@ class StatArbStrategy:
         
         return {
             "status": "running" if self.running else "stopped",
-            "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             "trading_enabled": not self.paused and self.running,
             "dry_run": self.dry_run,
             "symbol_a": self.symbol_a,
@@ -920,7 +1001,7 @@ class StatArbStrategy:
                     break
                 
                 # Update historical data periodically
-                if datetime.now().minute % 30 == 0:  # Every 30 minutes
+                if datetime.now(timezone.utc).minute % 30 == 0:  # Every 30 minutes
                     self._load_historical_data()
                 
                 time.sleep(5)  # Check every 5 seconds

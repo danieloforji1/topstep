@@ -25,7 +25,7 @@ class AnalyticsStore:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Enhanced trades table with market context
+        # Enhanced trades table with market context and ML features
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS trades_analytics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,9 +59,173 @@ class AnalyticsStore:
                 -- Market conditions
                 volume REAL,
                 price_change REAL,
-                price_change_pct REAL
+                price_change_pct REAL,
+                -- ML Features: Order Flow
+                bid_ask_imbalance REAL,
+                volume_imbalance REAL,
+                order_flow_direction TEXT,
+                spread REAL,
+                -- ML Features: Multi-Timeframe
+                distance_to_support REAL,
+                distance_to_resistance REAL,
+                support_strength REAL,
+                resistance_strength REAL,
+                nearest_support_price REAL,
+                nearest_resistance_price REAL,
+                -- ML Features: Time-based (derived from timestamp)
+                hour_of_day INTEGER,
+                minute_of_hour INTEGER,
+                day_of_week INTEGER,
+                minutes_since_open INTEGER,
+                minutes_to_close INTEGER,
+                -- ML Features: Grid context
+                distance_from_grid_mid REAL,
+                grid_levels_count INTEGER,
+                adaptive_levels_count INTEGER,
+                -- ML Features: Volatility context
+                volatility_percentile REAL,
+                atr_percentile REAL,
+                -- ML Features: Price action
+                price_momentum_1m REAL,
+                price_momentum_5m REAL,
+                price_change_from_open REAL,
+                -- ML Features: Additional context
+                is_grid_order INTEGER,  -- 1 if grid order, 0 if hedge/manual
+                hedge_position INTEGER,  -- Hedge position size at entry
+                primary_position_size INTEGER  -- Primary position size at entry
             )
         """)
+        
+        # Add new columns to existing table if they don't exist (for migration)
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN bid_ask_imbalance REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN volume_imbalance REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN order_flow_direction TEXT")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN spread REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN distance_to_support REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN distance_to_resistance REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN support_strength REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN resistance_strength REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN nearest_support_price REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN nearest_resistance_price REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN hour_of_day INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN minute_of_hour INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN day_of_week INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN minutes_since_open INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN minutes_to_close INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN distance_from_grid_mid REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN grid_levels_count INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN adaptive_levels_count INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN volatility_percentile REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN atr_percentile REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN price_momentum_1m REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN price_momentum_5m REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN price_change_from_open REAL")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN is_grid_order INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN hedge_position INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE trades_analytics ADD COLUMN primary_position_size INTEGER")
+        except sqlite3.OperationalError:
+            pass
         
         # Position history snapshots
         cursor.execute("""
@@ -246,9 +410,62 @@ class AnalyticsStore:
         # Market conditions
         volume: Optional[float] = None,
         price_change: Optional[float] = None,
-        price_change_pct: Optional[float] = None
+        price_change_pct: Optional[float] = None,
+        # ML Features: Order Flow
+        bid_ask_imbalance: Optional[float] = None,
+        volume_imbalance: Optional[float] = None,
+        order_flow_direction: Optional[str] = None,
+        spread: Optional[float] = None,
+        # ML Features: Multi-Timeframe
+        distance_to_support: Optional[float] = None,
+        distance_to_resistance: Optional[float] = None,
+        support_strength: Optional[float] = None,
+        resistance_strength: Optional[float] = None,
+        nearest_support_price: Optional[float] = None,
+        nearest_resistance_price: Optional[float] = None,
+        # ML Features: Grid context
+        distance_from_grid_mid: Optional[float] = None,
+        grid_levels_count: Optional[int] = None,
+        adaptive_levels_count: Optional[int] = None,
+        # ML Features: Volatility context
+        volatility_percentile: Optional[float] = None,
+        atr_percentile: Optional[float] = None,
+        # ML Features: Price action
+        price_momentum_1m: Optional[float] = None,
+        price_momentum_5m: Optional[float] = None,
+        price_change_from_open: Optional[float] = None,
+        # ML Features: Additional context
+        is_grid_order: Optional[int] = None,
+        hedge_position: Optional[int] = None,
+        primary_position_size: Optional[int] = None
     ):
-        """Record trade with full market and strategy context"""
+        """Record trade with full market and strategy context including ML features"""
+        # Calculate time-based features from timestamp
+        hour_of_day = timestamp.hour
+        minute_of_hour = timestamp.minute
+        day_of_week = timestamp.weekday()  # 0=Monday, 6=Sunday
+        
+        # Calculate minutes since market open (9:30 AM ET = 8:30 AM CT)
+        # Market opens at 8:30 AM CT
+        market_open_hour = 8
+        market_open_minute = 30
+        minutes_since_open = (hour_of_day - market_open_hour) * 60 + (minute_of_hour - market_open_minute)
+        if minutes_since_open < 0:
+            minutes_since_open = None  # Before market open
+        
+        # Calculate minutes to market close (3:45 PM CT)
+        market_close_hour = 15
+        market_close_minute = 45
+        minutes_to_close = (market_close_hour - hour_of_day) * 60 + (market_close_minute - minute_of_hour)
+        if minutes_to_close < 0:
+            minutes_to_close = None  # After market close
+        
+        # Calculate distance from grid mid if both available
+        if grid_mid is not None and price is not None:
+            distance_from_grid_mid = price - grid_mid
+        else:
+            distance_from_grid_mid = None
+        
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -258,13 +475,30 @@ class AnalyticsStore:
                 (trade_id, symbol, side, quantity, price, timestamp, order_id, fill_id, pnl, commission,
                  atr, volatility, correlation, current_price, grid_mid, grid_spacing, level_index,
                  position_before, position_after, avg_price_before, avg_price_after,
-                 daily_pnl, drawdown, exposure, volume, price_change, price_change_pct)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 daily_pnl, drawdown, exposure, volume, price_change, price_change_pct,
+                 bid_ask_imbalance, volume_imbalance, order_flow_direction, spread,
+                 distance_to_support, distance_to_resistance, support_strength, resistance_strength,
+                 nearest_support_price, nearest_resistance_price,
+                 hour_of_day, minute_of_hour, day_of_week, minutes_since_open, minutes_to_close,
+                 distance_from_grid_mid, grid_levels_count, adaptive_levels_count,
+                 volatility_percentile, atr_percentile,
+                 price_momentum_1m, price_momentum_5m, price_change_from_open,
+                 is_grid_order, hedge_position, primary_position_size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trade_id, symbol, side, quantity, price, timestamp, order_id, fill_id, pnl, commission,
                 atr, volatility, correlation, current_price, grid_mid, grid_spacing, level_index,
                 position_before, position_after, avg_price_before, avg_price_after,
-                daily_pnl, drawdown, exposure, volume, price_change, price_change_pct
+                daily_pnl, drawdown, exposure, volume, price_change, price_change_pct,
+                bid_ask_imbalance, volume_imbalance, order_flow_direction, spread,
+                distance_to_support, distance_to_resistance, support_strength, resistance_strength,
+                nearest_support_price, nearest_resistance_price,
+                hour_of_day, minute_of_hour, day_of_week, minutes_since_open, minutes_to_close,
+                distance_from_grid_mid, grid_levels_count, adaptive_levels_count,
+                volatility_percentile, atr_percentile,
+                price_momentum_1m, price_momentum_5m, price_change_from_open,
+                is_grid_order, hedge_position, primary_position_size
             ))
             conn.commit()
         except Exception as e:

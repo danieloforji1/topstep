@@ -26,6 +26,8 @@ from strategy.position_manager import PositionManager
 from strategy.risk_manager import RiskManager
 from strategy.sizer import Sizer
 from strategy.hedge_manager import HedgeManager
+from strategy.order_flow_analyzer import OrderFlowAnalyzer
+from strategy.multi_timeframe_analyzer import MultiTimeframeAnalyzer
 from execution.order_client import OrderClient
 from execution.fill_handler import FillHandler
 from observability.metrics import MetricsExporter
@@ -85,11 +87,41 @@ class GridStrategy:
         self.primary_symbol = self.config.get('primary_instrument', 'MES')
         self.hedge_symbol = self.config.get('hedge_instrument', 'MNQ')
         
+        # Initialize enhanced analyzers
+        self.order_flow_analyzer = None
+        if self.config.get('enable_order_flow', True):
+            self.order_flow_analyzer = OrderFlowAnalyzer(
+                lookback_period=self.config.get('order_flow_lookback', 20),
+                imbalance_threshold=self.config.get('order_flow_imbalance_threshold', 0.3)
+            )
+            logger.info("Order flow analyzer enabled")
+        
+        self.multi_timeframe_analyzer = None
+        if self.config.get('enable_multi_timeframe', True):
+            mtf_timeframes = self.config.get('mtf_timeframes', ['1h', '4h'])
+            mtf_lookbacks = {
+                '1h': self.config.get('mtf_lookback_1h', 50),
+                '4h': self.config.get('mtf_lookback_4h', 30)
+            }
+            self.multi_timeframe_analyzer = MultiTimeframeAnalyzer(
+                primary_timeframe='15m',
+                higher_timeframes=mtf_timeframes,
+                lookback_periods=mtf_lookbacks
+            )
+            logger.info(f"Multi-timeframe analyzer enabled: {mtf_timeframes}")
+        
+        # Initialize grid manager with enhanced features
         self.grid_manager = GridManager(
             symbol=self.primary_symbol,
             levels_each_side=self.config.get('grid_levels_each_side', 5),
             tick_size=0.25,  # MES tick size
-            state_persistence=self.state_persistence
+            state_persistence=self.state_persistence,
+            adaptive_density=self.config.get('adaptive_density', True),
+            base_levels_each_side=self.config.get('base_levels_each_side', 3),
+            min_levels_each_side=self.config.get('min_levels_each_side', 2),
+            max_levels_each_side=self.config.get('max_levels_each_side', 5),
+            order_flow_analyzer=self.order_flow_analyzer,
+            multi_timeframe_analyzer=self.multi_timeframe_analyzer
         )
         
         self.position_manager = PositionManager(
@@ -309,10 +341,10 @@ class GridStrategy:
         return True
     
     def _load_historical_data(self):
-        """Load historical candles for indicators"""
+        """Load historical candles for indicators and multi-timeframe analysis"""
         logger.info("Loading historical data...")
         
-        # Get bars from API
+        # Get bars from API (primary timeframe)
         bars = self.api_client.get_bars(
             contract_id=self.primary_contract_id,
             interval="15m",
@@ -323,13 +355,43 @@ class GridStrategy:
             adapter = MarketDataAdapter()
             candles = adapter.normalize_bars(bars, self.primary_symbol, "15m")
             self.timeseries_store.store_candles(candles)
-            logger.info(f"Loaded {len(candles)} historical candles")
+            logger.info(f"Loaded {len(candles)} historical candles (15m)")
             
             # Initialize current_price from most recent candle
             if candles and not self.current_price:
                 self.current_price = candles[-1].close
                 self.position_manager.update_price(self.primary_symbol, self.current_price)
                 logger.info(f"Initialized {self.primary_symbol} price from historical data: {self.current_price:.2f}")
+        
+        # Load multi-timeframe data for support/resistance analysis
+        if self.multi_timeframe_analyzer:
+            mtf_data = {}
+            for timeframe in self.multi_timeframe_analyzer.higher_timeframes:
+                lookback = self.multi_timeframe_analyzer.lookback_periods.get(timeframe, 50)
+                bars = self.api_client.get_bars(
+                    contract_id=self.primary_contract_id,
+                    interval=timeframe,
+                    limit=lookback
+                )
+                if bars:
+                    adapter = MarketDataAdapter()
+                    candles = adapter.normalize_bars(bars, self.primary_symbol, timeframe)
+                    # Convert to dict format for analyzer
+                    mtf_data[timeframe] = [
+                        {
+                            'high': c.high,
+                            'low': c.low,
+                            'open': c.open,
+                            'close': c.close,
+                            'volume': c.volume
+                        }
+                        for c in candles
+                    ]
+                    logger.info(f"Loaded {len(candles)} candles for {timeframe} timeframe")
+            
+            if mtf_data:
+                self.multi_timeframe_analyzer.update_levels(mtf_data)
+                logger.info("Multi-timeframe levels updated")
         
         # Load hedge data
         if self.hedge_contract_id:
@@ -476,6 +538,22 @@ class GridStrategy:
                 if symbol_id == primary_symbol_id:
                     self.current_price = float(last_price)
                     self.position_manager.update_price(self.primary_symbol, self.current_price)
+                    
+                    # Feed order flow data if analyzer is enabled
+                    if self.order_flow_analyzer:
+                        bid_size = data.get('bidSize') or data.get('bid')
+                        ask_size = data.get('askSize') or data.get('ask')
+                        spread = data.get('spread') or (ask_size - bid_size if bid_size and ask_size else None)
+                        volume = data.get('volume')
+                        
+                        self.order_flow_analyzer.add_snapshot(
+                            price=self.current_price,
+                            bid_size=float(bid_size) if bid_size else None,
+                            ask_size=float(ask_size) if ask_size else None,
+                            spread=float(spread) if spread else None,
+                            volume=float(volume) if volume else None
+                        )
+                    
                     logger.debug(f"Updated {self.primary_symbol} price: {self.current_price:.2f}")
                 
                 # Update current price for hedge instrument
@@ -576,6 +654,15 @@ class GridStrategy:
                 hedge_vol = calculate_volatility(hedge_candles, vol_window)
                 correlation = calculate_correlation(vol_candles, hedge_candles, vol_window)
         
+        # Calculate volatility percentile for adaptive density
+        volatility_percentile = None
+        if primary_vol and self.grid_manager.adaptive_density:
+            # Calculate percentile from volatility history
+            if len(self.grid_manager.volatility_history) >= 20:
+                sorted_vol = sorted(self.grid_manager.volatility_history)
+                percentile = sum(1 for v in sorted_vol if v < primary_vol) / len(sorted_vol)
+                volatility_percentile = percentile
+        
         # Update managers
         if atr:
             spacing = atr * self.config.get('atr_multiplier_for_spacing', 0.45)
@@ -589,13 +676,15 @@ class GridStrategy:
             if correlation is not None:
                 self._last_correlation = correlation
             
-            # Update grid if needed
+            # Update grid if needed (with volatility for adaptive density)
             grid_rebuilt = False
             if self.current_price:
                 grid_rebuilt = self.grid_manager.rebuild_grid_if_needed(
                     self.current_price,
                     spacing,
-                    base_lot
+                    base_lot,
+                    volatility=primary_vol,
+                    volatility_percentile=volatility_percentile
                 )
                 
                 # Record grid rebuild decision
@@ -1018,7 +1107,107 @@ class GridStrategy:
                         realized_after = self.position_manager.get_realized_pnl(symbol)
                         trade_pnl = realized_after - realized_before
                     
-                    # Record trade with full context
+                    # Get level_index if this is a grid order
+                    # Note: fill_handler already calls grid_manager.on_fill, so check filled levels
+                    level_index = None
+                    is_grid_order = 0
+                    if symbol == self.primary_symbol:
+                        # Check if this price is in grid manager's filled levels
+                        for grid_order in self.grid_manager.orders.values():
+                            if grid_order.order_id == str(order_id) and grid_order.filled:
+                                level_index = grid_order.level.level_index
+                                is_grid_order = 1
+                                break
+                        # Also check if price matches a grid level
+                        if level_index is None:
+                            for level in self.grid_manager.levels:
+                                if abs(level.price - price) < 0.1:  # Within 0.1 of level price
+                                    level_index = level.level_index
+                                    is_grid_order = 1
+                                    break
+                    
+                    # Get order flow features
+                    bid_ask_imbalance = None
+                    volume_imbalance = None
+                    order_flow_direction = None
+                    spread = None
+                    if self.order_flow_analyzer:
+                        bid_ask_imbalance = self.order_flow_analyzer.get_bid_ask_imbalance()
+                        volume_imbalance = self.order_flow_analyzer.get_volume_imbalance()
+                        order_flow_direction = self.order_flow_analyzer.get_order_flow_direction()
+                        # Get spread from most recent snapshot
+                        if self.order_flow_analyzer.snapshots:
+                            spread = self.order_flow_analyzer.snapshots[-1].spread
+                    
+                    # Get multi-timeframe features
+                    distance_to_support = None
+                    distance_to_resistance = None
+                    support_strength = None
+                    resistance_strength = None
+                    nearest_support_price = None
+                    nearest_resistance_price = None
+                    if self.multi_timeframe_analyzer and price:
+                        support, resistance = self.multi_timeframe_analyzer.get_nearest_levels(price)
+                        if support:
+                            distance_to_support = price - support.price
+                            support_strength = support.strength
+                            nearest_support_price = support.price
+                        if resistance:
+                            distance_to_resistance = resistance.price - price
+                            resistance_strength = resistance.strength
+                            nearest_resistance_price = resistance.price
+                    
+                    # Calculate price momentum (1m and 5m)
+                    price_momentum_1m = None
+                    price_momentum_5m = None
+                    price_change_from_open = None
+                    try:
+                        # Get recent candles for momentum calculation
+                        candles_1m = self.timeseries_store.get_candles(symbol, "1m", limit=2)
+                        candles_5m = self.timeseries_store.get_candles(symbol, "5m", limit=2)
+                        candles_15m = self.timeseries_store.get_candles(symbol, "15m", limit=20)
+                        
+                        if len(candles_1m) >= 2:
+                            price_momentum_1m = (candles_1m[-1].close - candles_1m[-2].close) / candles_1m[-2].close
+                        
+                        if len(candles_5m) >= 2:
+                            price_momentum_5m = (candles_5m[-1].close - candles_5m[-2].close) / candles_5m[-2].close
+                        
+                        # Price change from market open (first 15m candle of day)
+                        if candles_15m:
+                            # Find first candle of current day
+                            current_date = datetime.now().date()
+                            for candle in candles_15m:
+                                if candle.timestamp.date() == current_date:
+                                    price_change_from_open = (price - candle.open) / candle.open
+                                    break
+                    except Exception as e:
+                        logger.debug(f"Error calculating price momentum: {e}")
+                    
+                    # Calculate volatility and ATR percentiles
+                    volatility_percentile = None
+                    atr_percentile = None
+                    if self.grid_manager.adaptive_density:
+                        if len(self.grid_manager.volatility_history) >= 20:
+                            sorted_vol = sorted(self.grid_manager.volatility_history)
+                            if volatility:
+                                volatility_percentile = sum(1 for v in sorted_vol if v < volatility) / len(sorted_vol)
+                            if atr:
+                                # Calculate ATR percentile from history
+                                atr_history = [v for v in self.grid_manager.volatility_history if v > 0]
+                                if len(atr_history) >= 20:
+                                    sorted_atr = sorted(atr_history)
+                                    atr_percentile = sum(1 for v in sorted_atr if v < atr) / len(sorted_atr)
+                    
+                    # Get grid context
+                    grid_levels_count = len(self.grid_manager.levels) if self.grid_manager.levels else None
+                    adaptive_levels_count = self.grid_manager.levels_each_side if hasattr(self.grid_manager, 'levels_each_side') else None
+                    
+                    # Get position sizes
+                    hedge_position = self.position_manager.get_net_position(self.hedge_symbol) if self.hedge_symbol else None
+                    primary_position_size = self.position_manager.get_net_position(self.primary_symbol)
+                    
+                    # Record trade with full context including all ML features
                     self.analytics_store.record_trade_with_context(
                         trade_id=f"{order_id}_{int(time.time())}",
                         symbol=symbol,
@@ -1035,14 +1224,40 @@ class GridStrategy:
                         current_price=price,
                         grid_mid=self.grid_manager.grid_mid,
                         grid_spacing=self.grid_manager.spacing,
-                        level_index=None,  # Will be set if it's a grid order
+                        level_index=level_index,
                         position_before=position_before,
                         position_after=position_after,
                         avg_price_before=avg_price_before,
                         avg_price_after=avg_price_after,
                         daily_pnl=self.risk_manager.get_daily_pnl(),
                         drawdown=self.risk_manager.get_trailing_drawdown(),
-                        exposure=self.position_manager.net_exposure_dollars()
+                        exposure=self.position_manager.net_exposure_dollars(),
+                        # Order Flow features
+                        bid_ask_imbalance=bid_ask_imbalance,
+                        volume_imbalance=volume_imbalance,
+                        order_flow_direction=order_flow_direction,
+                        spread=spread,
+                        # Multi-Timeframe features
+                        distance_to_support=distance_to_support,
+                        distance_to_resistance=distance_to_resistance,
+                        support_strength=support_strength,
+                        resistance_strength=resistance_strength,
+                        nearest_support_price=nearest_support_price,
+                        nearest_resistance_price=nearest_resistance_price,
+                        # Grid context
+                        grid_levels_count=grid_levels_count,
+                        adaptive_levels_count=adaptive_levels_count,
+                        # Volatility context
+                        volatility_percentile=volatility_percentile,
+                        atr_percentile=atr_percentile,
+                        # Price action
+                        price_momentum_1m=price_momentum_1m,
+                        price_momentum_5m=price_momentum_5m,
+                        price_change_from_open=price_change_from_open,
+                        # Additional context
+                        is_grid_order=is_grid_order,
+                        hedge_position=hedge_position,
+                        primary_position_size=primary_position_size
                     )
                     
                     # Record order event

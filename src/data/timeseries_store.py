@@ -9,7 +9,10 @@ from datetime import datetime
 import pandas as pd
 from pathlib import Path
 
-from connectors.market_data_adapter import Candle, Tick
+try:
+    from src.connectors.market_data_adapter import Candle, Tick
+except ImportError:
+    from connectors.market_data_adapter import Candle, Tick
 
 logger = logging.getLogger(__name__)
 

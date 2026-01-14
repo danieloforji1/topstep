@@ -10,7 +10,7 @@ z_entry: 2.0       # Z-score entry threshold (±2.0 means enter when |z| > 2.0)
 z_exit: 0.6        # Z-score exit threshold (exit when |z| < 0.6)
 
 # Risk Management
-spread_stop_std: 3.0      # Stop loss in standard deviations of spread
+spread_stop_std: 2.2      # Stop loss in standard deviations of spread (tightened from 3.0)
 time_stop_hours: 2.0      # Maximum hold time in hours
 risk_per_trade: 100.0     # Dollar amount to risk per trade (0.5-1.0% of account)
 max_daily_loss: 900       # Maximum daily loss (Topstep has 1000) - leave buffer
@@ -22,6 +22,7 @@ lookback_periods: 1440    # Rolling window for mean/std calculation (1 day of 1-
 min_lookback: 100         # Minimum periods needed before generating signals
 beta_lookback: 500        # Periods for beta (hedge ratio) calculation
 recalc_interval_seconds: 30  # Recalculate spread/z-score every N seconds
+spread_divergence_hours: 4.0  # Don't enter if spread has been extreme for >N hours
 
 # TopstepX API Configuration
 api_base_url: https://api.topstepx.com
