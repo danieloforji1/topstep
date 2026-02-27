@@ -199,9 +199,27 @@ class AsianRangeStrategy:
         # Strategy components
         self.symbol = self.config.get('instrument', 'MGC')
         
+        # Include multipliers for common symbols that might appear from other strategies on same account
         self.position_manager = PositionManager(
             max_net_notional=self.config.get('max_net_notional', 5000.0),
-            tick_values={self.symbol: MGC_SPECS.tick_value}
+            tick_values={
+                self.symbol: MGC_SPECS.tick_value,
+                'MES': 5.0,  # MES tick value
+                'MNQ': 2.0,  # MNQ tick value
+                'GC': 10.0   # GC tick value
+            },
+            tick_sizes={
+                self.symbol: MGC_SPECS.tick_size,  # MGC tick size = 0.10
+                'MES': 0.25,  # MES tick size
+                'MNQ': 0.25,  # MNQ tick size
+                'GC': 0.10    # GC tick size
+            },
+            contract_multipliers={
+                self.symbol: 10.0,  # CRITICAL: MGC = 10 oz per contract (not 100!)
+                'MES': 5.0,   # MES contract multiplier
+                'MNQ': 2.0,   # MNQ contract multiplier
+                'GC': 100.0   # GC contract multiplier
+            }
         )
         
         self.risk_manager = RiskManager(

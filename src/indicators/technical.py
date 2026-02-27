@@ -107,6 +107,32 @@ def calculate_correlation(
     return correlation if not np.isnan(correlation) else None
 
 
+def calculate_trend_strength(
+    candles: List[Candle],
+    window: int = 20,
+    atr_window: int = 14
+) -> Optional[float]:
+    """
+    Calculate trend strength in ATR units over a window.
+
+    Positive values indicate uptrend, negative values indicate downtrend.
+    """
+    if len(candles) < max(window, atr_window) + 1:
+        return None
+    
+    recent = candles[-window:]
+    if len(recent) < window:
+        return None
+    
+    atr = calculate_atr(candles[-(atr_window + 1):], atr_window)
+    if atr is None or atr == 0:
+        return None
+    
+    start_price = recent[0].close
+    end_price = recent[-1].close
+    return (end_price - start_price) / atr
+
+
 def calculate_atr_from_dataframe(df: pd.DataFrame, window: int = 14) -> pd.Series:
     """
     Calculate ATR from pandas DataFrame (more efficient for large datasets)

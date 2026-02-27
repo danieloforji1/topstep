@@ -19,7 +19,7 @@ partial_close_percent: 0.75   # Percentage to close at 12 PM (0.75 = 75%, remain
 # Risk Management
 max_daily_loss: 900           # Maximum daily loss (Topstep has 1000) - leave buffer
 trailing_drawdown_limit: 1800  # Maximum trailing drawdown
-max_net_notional: 5000        # Maximum net exposure in dollars
+max_net_notional: 1000000         # Maximum net exposure in dollars (updated: with correct multiplier, 5 MGC @ $5000 = $25k notional)
 
 # TopstepX API Configuration
 api_base_url: https://api.topstepx.com

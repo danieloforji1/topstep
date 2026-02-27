@@ -56,8 +56,8 @@ class Position:
                     total_cost = (self.quantity * self.avg_price) - (quantity * price)
                     self.avg_price = total_cost / self.quantity if self.quantity != 0 else price
     
-    def get_unrealized_pnl(self, current_price: float, tick_value: float = 5.0) -> float:
-        """Calculate unrealized P&L"""
+    def get_unrealized_pnl(self, current_price: float, tick_value: float = 5.0, tick_size: float = 0.25) -> float:
+        """Calculate unrealized P&L (properly converts price_diff to ticks first)"""
         if self.quantity == 0:
             return 0.0
         
@@ -65,11 +65,13 @@ class Position:
         if self.quantity < 0:  # Short position
             price_diff = -price_diff
         
-        return price_diff * abs(self.quantity) * tick_value
+        # Convert price movement to ticks, then calculate P&L
+        ticks = price_diff / tick_size if tick_size > 0 else 0.0
+        return ticks * tick_value * abs(self.quantity)
     
-    def get_total_pnl(self, current_price: float, tick_value: float = 5.0) -> float:
+    def get_total_pnl(self, current_price: float, tick_value: float = 5.0, tick_size: float = 0.25) -> float:
         """Get total P&L (realized + unrealized)"""
-        return self.realized_pnl + self.get_unrealized_pnl(current_price, tick_value)
+        return self.realized_pnl + self.get_unrealized_pnl(current_price, tick_value, tick_size)
 
 
 class PositionManager:
@@ -78,10 +80,16 @@ class PositionManager:
     def __init__(
         self,
         max_net_notional: float = 1200.0,
-        tick_values: Optional[Dict[str, float]] = None
+        tick_values: Optional[Dict[str, float]] = None,
+        tick_sizes: Optional[Dict[str, float]] = None,
+        contract_multipliers: Optional[Dict[str, float]] = None
     ):
         self.max_net_notional = max_net_notional
         self.tick_values = tick_values or {"MES": 5.0, "MNQ": 2.0}  # Default tick values
+        # Contract multipliers: GC = 100 oz, MGC = 10 oz
+        self.contract_multipliers = contract_multipliers or {"GC": 100.0, "MGC": 10.0, "MES": 5.0, "MNQ": 2.0}
+        # Tick sizes for proper P&L calculation
+        self.tick_sizes = tick_sizes or {"GC": 0.10, "MGC": 0.10, "MES": 0.25, "MNQ": 0.25}
         self.positions: Dict[str, Position] = {}
         self.current_prices: Dict[str, float] = {}
         
@@ -132,17 +140,27 @@ class PositionManager:
         Reconcile internal positions with TopstepX API positions.
         Uses API values as source of truth for P&L.
         
+        CRITICAL: This REPLACES internal positions with API positions.
+        If a symbol is not in api_positions, it means position is 0 (closed).
+        
         Args:
             api_positions: List of position dicts from TopstepX API
         """
+        # Track which symbols we see in API response
+        symbols_seen = set()
+        
         if not api_positions:
+            # API says no positions - clear all internal positions
+            logger.debug("API reports no positions - clearing all internal positions")
+            self.positions.clear()
             return
         
-        # Log the full API response structure to see what fields are available
-        if api_positions:
+        # Log the full API response structure ONCE (first time only) to see what fields are available
+        if api_positions and not hasattr(self, '_api_structure_logged'):
             logger.info(f"TopstepX API Position Data Structure (first position):")
             logger.info(f"  Full response: {json.dumps(api_positions[0], indent=2, default=str)}")
             logger.info(f"  Available fields: {list(api_positions[0].keys())}")
+            self._api_structure_logged = True
         
         # Map API positions by contract/symbol
         for api_pos in api_positions:
@@ -163,10 +181,13 @@ class PositionManager:
             avg_price = api_pos.get('averagePrice', 0.0)
             position_type = api_pos.get('type', 0)  # 1=Long, 2=Short
             
-            logger.info(f"Position from API - Symbol: {symbol}, Size: {size}, AvgPrice: {avg_price}, Type: {position_type}")
+            # Changed to DEBUG to reduce log noise - only log if position changed
+            if symbol not in self.positions or self.positions[symbol].quantity != (size if position_type == 1 else -size if position_type == 2 else 0):
+                logger.debug(f"Position from API - Symbol: {symbol}, Size: {size}, AvgPrice: {avg_price}, Type: {position_type}")
             
             # Convert to our format (positive=long, negative=short)
             quantity = size if position_type == 1 else -size if position_type == 2 else 0
+            symbols_seen.add(symbol)
             
             # Update or create position
             # CRITICAL: API is the source of truth - REPLACE, don't add
@@ -183,6 +204,20 @@ class PositionManager:
             # Store API P&L values if available (these are the source of truth)
             # Note: TopstepX API may provide P&L in different fields
             # Check common field names (trying both camelCase and snake_case)
+            api_unrealized = (
+                api_pos.get('unrealizedPnl') or
+                api_pos.get('unrealizedProfitLoss') or
+                api_pos.get('openProfitLoss') or
+                api_pos.get('unrealized_pnl') or
+                None
+            )
+            api_realized = (
+                api_pos.get('realizedPnl') or
+                api_pos.get('closedProfitLoss') or
+                api_pos.get('realized_profit_loss') or
+                api_pos.get('realized_pnl') or
+                None
+            )
             api_pnl = (
                 api_pos.get('profitAndLoss') or
                 api_pos.get('pnl') or
@@ -194,24 +229,40 @@ class PositionManager:
                 None
             )
             
-            # Log all potential P&L fields to see what's actually there
-            pnl_fields = {
-                'profitAndLoss': api_pos.get('profitAndLoss'),
-                'pnl': api_pos.get('pnl'),
-                'realizedPnl': api_pos.get('realizedPnl'),
-                'unrealizedPnl': api_pos.get('unrealizedPnl'),
-                'profit_and_loss': api_pos.get('profit_and_loss'),
-                'realized_pnl': api_pos.get('realized_pnl'),
-                'unrealized_pnl': api_pos.get('unrealized_pnl'),
-            }
-            logger.info(f"P&L fields in API response for {symbol}: {pnl_fields}")
-            
+            # Changed to DEBUG - only log P&L fields on first reconciliation or if P&L becomes available
             if api_pnl is not None:
                 # If API provides total P&L, we'll use it
+                if symbol not in self.api_total_pnl or self.api_total_pnl[symbol] != float(api_pnl):
+                    logger.debug(f"P&L fields in API response for {symbol}: Using API P&L ${api_pnl:.2f}")
                 self.api_total_pnl[symbol] = float(api_pnl)
-                logger.info(f"✓ Using API P&L for {symbol}: ${api_pnl:.2f}")
             else:
-                logger.warning(f"✗ No P&L field found in API response for {symbol}. Will calculate internally.")
+                # Only log warning once per symbol per session (not every reconciliation)
+                if not hasattr(self, '_pnl_warning_logged'):
+                    self._pnl_warning_logged = set()
+                if symbol not in self._pnl_warning_logged:
+                    logger.debug(f"P&L fields in API response for {symbol}: No P&L field found, will calculate internally")
+                    self._pnl_warning_logged.add(symbol)
+            
+            if api_unrealized is not None:
+                self.api_unrealized_pnl[symbol] = float(api_unrealized)
+            else:
+                self.api_unrealized_pnl.pop(symbol, None)
+            
+            if api_realized is not None:
+                self.api_realized_pnl[symbol] = float(api_realized)
+            else:
+                self.api_realized_pnl.pop(symbol, None)
+        
+        # CRITICAL: Clear positions for symbols NOT in API response (they were closed)
+        # This prevents stale positions from accumulating
+        symbols_to_remove = set(self.positions.keys()) - symbols_seen
+        for symbol in symbols_to_remove:
+            logger.debug(f"Position {symbol} not in API response (closed) - removing from internal tracking")
+            del self.positions[symbol]
+            # Also clear API P&L tracking
+            self.api_total_pnl.pop(symbol, None)
+            self.api_realized_pnl.pop(symbol, None)
+            self.api_unrealized_pnl.pop(symbol, None)
         
         self.last_api_sync = datetime.now()
     
@@ -250,8 +301,9 @@ class PositionManager:
             if not pos:
                 return 0.0
             tick_value = self.tick_values.get(symbol, 5.0)
+            tick_size = self.tick_sizes.get(symbol, 0.25)
             price = self.current_prices.get(symbol, pos.avg_price)
-            return pos.get_unrealized_pnl(price, tick_value)
+            return pos.get_unrealized_pnl(price, tick_value, tick_size)
         
         # Total across all symbols
         total = 0.0
@@ -261,8 +313,9 @@ class PositionManager:
             elif sym in self.positions:
                 pos = self.positions[sym]
                 tick_value = self.tick_values.get(sym, 5.0)
+                tick_size = self.tick_sizes.get(sym, 0.25)
                 price = self.current_prices.get(sym, pos.avg_price)
-                total += pos.get_unrealized_pnl(price, tick_value)
+                total += pos.get_unrealized_pnl(price, tick_value, tick_size)
         return total
     
     def get_total_pnl(self) -> float:
@@ -280,14 +333,14 @@ class PositionManager:
         return self.get_realized_pnl() + self.get_unrealized_pnl()
     
     def net_exposure_dollars(self) -> float:
-        """Calculate net exposure in dollars"""
+        """Calculate net exposure in dollars (gross notional value)"""
         total = 0.0
         for symbol, pos in self.positions.items():
-            tick_value = self.tick_values.get(symbol, 5.0)
             price = self.current_prices.get(symbol, pos.avg_price)
-            # Approximate notional: quantity * price * contract_multiplier
-            # For micro contracts, we'll use a simplified calculation
-            notional = abs(pos.quantity) * price * tick_value  # Simplified
+            # Proper notional calculation: quantity * price * contract_multiplier
+            # GC multiplier = 100 oz, MGC multiplier = 10 oz
+            contract_multiplier = self.contract_multipliers.get(symbol, 100.0)
+            notional = abs(pos.quantity) * price * contract_multiplier
             total += notional
         
         return total

@@ -1,0 +1,94 @@
+# Wick Reversal Strategy Configuration
+# Trades reversals after "fat" hourly wicks with pullback confirmation
+
+# Trading Instruments (supports multiple)
+# Can specify single instrument for backward compatibility:
+# instrument: MES
+# Or specify multiple instruments:
+instruments: [MES, MNQ, MYM, M2K]  # Trade multiple instruments simultaneously
+# Available options:
+# Equity Indices (RECOMMENDED for mean-reversion):
+#   - MES: Micro E-mini S&P 500 (0.25 tick, $1.25/tick) - EXCELLENT
+#   - MNQ: Micro E-mini Nasdaq (0.25 tick, $0.50/tick) - EXCELLENT
+#   - MYM: Micro Dow Jones (1.0 tick, $0.50/tick) - HIGHLY RECOMMENDED
+#   - M2K: Micro Russell 2000 (0.10 tick, $0.50/tick) - HIGHLY RECOMMENDED
+# Metals:
+#   - MGC: Micro Gold (0.10 tick, $1.00/tick) - Good but trends more
+#   - GC: Full Gold (0.10 tick, $10.00/tick) - Higher risk
+# FX (if available):
+#   - M6E: Micro Euro (0.0001 tick, $1.25/tick)
+#   - M6B: Micro British Pound (0.0001 tick, $0.625/tick)
+# See WICK_REVERSAL_INSTRUMENTS.md for detailed analysis
+
+# Strategy Parameters
+wick_threshold: 0.5          # Minimum wick % of total range (0.5 = 50%)
+pullback_tolerance: 0.05     # Tolerance around 50% wick midpoint (0.05 = 5%)
+stop_fraction: 0.5           # Stop beyond extreme by this fraction of wick (0.5 = 50% of wick)
+target_multiple: 1.0         # Take profit multiple of stop distance (1.0 = 1:1 R:R)
+
+# Timeframes
+long_timeframe: 1h           # Timeframe for fat wick detection
+short_timeframe: 1m          # Timeframe for structure break confirmation
+structure_lookback: 10       # Number of bars to check for structure breaks
+entry_min_conditions: 2      # Flexible mode: allow entry when 2 of 3 gates pass (pullback/structure/trend)
+
+# Risk Management
+risk_per_trade: 100.0        # Dollar amount to risk per trade
+max_contracts: 5            # Maximum contracts per trade
+# Note: tick_size is now per-instrument (handled automatically)
+max_daily_loss: 900         # Maximum daily loss (Topstep has 1000) - leave buffer
+trailing_drawdown_limit: 1800  # Maximum trailing drawdown
+max_net_notional: 60000000     # Maximum net exposure in dollars
+
+# Wick Management
+max_wick_age_hours: 24.0    # Expire wicks after this many hours
+
+# TopstepX API Configuration
+api_base_url: https://api.topstepx.com
+user_hub_url: https://rtc.topstepx.com/hubs/user
+market_hub_url: https://rtc.topstepx.com/hubs/market
+
+# Observability
+metrics_port: 8003          # Different port from other strategies
+log_level: INFO
+
+# Trading Mode
+dry_run: true               # Set to false for live trading (requires explicit enable)
+
+# Account Selection
+prefer_practice_account: true  # Prefer practice/simulated accounts over live
+account_id: null             # Optional: specify account ID directly (overrides auto-selection)
+
+# Pullback tolerance (choose one method)
+# If pullback_tolerance_wick_relative is true, uses wick size (recommended for multi-instrument)
+# If false, uses pullback_tolerance_absolute (must be appropriate for all instruments)
+pullback_tolerance_absolute: 2.0  # Absolute price points (only used if wick_relative is false)
+pullback_tolerance_wick_relative: true  # Use wick size instead of price (RECOMMENDED for MES/MNQ/MGC mix)
+
+# Structure detection
+# Minimum move size in price points - adjust per instrument if needed
+# MES/MNQ: 0.5 points = 2 ticks (reasonable)
+# MGC: 0.5 points = 5 ticks (reasonable)
+structure_min_move: 0.5  # Minimum move size in price points
+structure_swing_lookback: 5  # Bars for swing detection
+
+# Trend filter
+trend_filter_enabled: true
+trend_ema_period: 50
+
+# Volume confirmation
+volume_confirmation_enabled: true
+volume_multiplier: 1.2
+
+# Position management
+max_position_hours: 48.0
+partial_profit_enabled: true
+partial_profit_ratio: 0.5
+trailing_stop_enabled: false
+trailing_stop_distance: 0.3
+
+# API throttling / diagnostics
+orders_poll_interval_seconds: 20
+positions_poll_interval_seconds: 20
+accounts_poll_interval_seconds: 30
+heartbeat_interval_seconds: 60

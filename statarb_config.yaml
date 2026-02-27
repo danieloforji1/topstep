@@ -6,16 +6,21 @@ instrument_a: GC   # Full Gold Futures
 instrument_b: MGC  # Micro Gold Futures
 
 # Strategy Parameters
-z_entry: 2.0       # Z-score entry threshold (±2.0 means enter when |z| > 2.0)
+z_entry: 1.7       # Z-score entry threshold (±1.7 means enter when |z| > 1.7)
 z_exit: 0.6        # Z-score exit threshold (exit when |z| < 0.6)
 
 # Risk Management
-spread_stop_std: 2.2      # Stop loss in standard deviations of spread (tightened from 3.0)
+spread_stop_std: 1.5      # Stop loss in standard deviations of spread
 time_stop_hours: 2.0      # Maximum hold time in hours
 risk_per_trade: 100.0     # Dollar amount to risk per trade (0.5-1.0% of account)
 max_daily_loss: 900       # Maximum daily loss (Topstep has 1000) - leave buffer
 trailing_drawdown_limit: 1800  # Maximum trailing drawdown
-max_net_notional: 10000   # Maximum net exposure in dollars
+max_net_notional: 16000000   # Maximum net exposure in dollars
+
+# Profit Taking & Trailing Stop
+partial_profit_z: 1.0      # Take partial profits when |z| <= this level
+partial_profit_fraction: 0.5  # Portion to exit on partial profit (0.1 - 0.9)
+trailing_stop_std: 1.0     # Trailing stop distance in std dev after partial
 
 # Calculation Settings
 lookback_periods: 1440    # Rolling window for mean/std calculation (1 day of 1-min bars)
@@ -23,6 +28,17 @@ min_lookback: 100         # Minimum periods needed before generating signals
 beta_lookback: 500        # Periods for beta (hedge ratio) calculation
 recalc_interval_seconds: 30  # Recalculate spread/z-score every N seconds
 spread_divergence_hours: 4.0  # Don't enter if spread has been extreme for >N hours
+
+# Dynamic Position Sizing
+dynamic_sizing_enabled: true  # Enable dynamic position sizing based on stop distance
+max_risk_multiplier: 5.0     # Maximum allowed risk multiplier (5x = $500 risk if intended is $100)
+min_risk_multiplier: 0.3     # Minimum risk multiplier (0.3x = $30 risk if intended is $100)
+max_contracts_gc: 2          # Maximum GC contracts per trade (hard cap: 2 GC = 10 MGC max)
+
+# Volatility-Based Stop Adjustment
+volatility_stop_adjustment: true  # Adjust stop loss based on volatility
+high_volatility_threshold: 10.0  # Spread std threshold for high volatility ($10)
+high_volatility_stop_std: 1.0    # Tighter stop in high volatility (1.0 std instead of 1.5)
 
 # TopstepX API Configuration
 api_base_url: https://api.topstepx.com

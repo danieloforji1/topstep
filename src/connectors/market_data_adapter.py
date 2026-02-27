@@ -41,23 +41,61 @@ class MarketDataAdapter:
     def normalize_tick(data: Dict[str, Any], symbol: str) -> Optional[Tick]:
         """Convert TopstepX quote/trade data to Tick"""
         try:
+            def _first_float(*keys) -> Optional[float]:
+                for key in keys:
+                    val = data.get(key)
+                    if val is None:
+                        continue
+                    try:
+                        return float(val)
+                    except (TypeError, ValueError):
+                        continue
+                return None
+
+            def _get_timestamp() -> datetime:
+                ts = data.get("timestamp") or data.get("time") or data.get("t")
+                if isinstance(ts, str):
+                    return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                if isinstance(ts, (int, float)):
+                    return datetime.fromtimestamp(ts)
+                return datetime.now()
+
+            def _get_volume() -> float:
+                vol = _first_float("volume", "size", "lastSize", "quantity")
+                return vol if vol is not None else 0.0
+
             # Handle GatewayQuote format
-            if "lastPrice" in data:
+            if "lastPrice" in data or "bestBid" in data or "bestAsk" in data:
+                price = _first_float("lastPrice", "last", "lastTradePrice", "tradePrice", "close", "mark")
+                if price is None:
+                    bid = _first_float("bestBid", "bid")
+                    ask = _first_float("bestAsk", "ask")
+                    if bid is not None and ask is not None:
+                        price = (bid + ask) / 2.0
+                    elif bid is not None:
+                        price = bid
+                    elif ask is not None:
+                        price = ask
+                if price is None:
+                    return None
                 return Tick(
                     symbol=symbol,
-                    price=data.get("lastPrice", 0.0),
-                    volume=data.get("volume", 0.0),
-                    timestamp=datetime.fromisoformat(data.get("timestamp", datetime.now().isoformat()).replace('Z', '+00:00')),
-                    bid=data.get("bestBid"),
-                    ask=data.get("bestAsk")
+                    price=price,
+                    volume=_get_volume(),
+                    timestamp=_get_timestamp(),
+                    bid=_first_float("bestBid", "bid"),
+                    ask=_first_float("bestAsk", "ask")
                 )
             # Handle GatewayTrade format
-            elif "price" in data:
+            elif "price" in data or "tradePrice" in data or "lastTradePrice" in data:
+                price = _first_float("price", "tradePrice", "lastTradePrice", "last")
+                if price is None:
+                    return None
                 return Tick(
                     symbol=symbol,
-                    price=data.get("price", 0.0),
-                    volume=data.get("volume", 0.0),
-                    timestamp=datetime.fromisoformat(data.get("timestamp", datetime.now().isoformat()).replace('Z', '+00:00'))
+                    price=price,
+                    volume=_get_volume(),
+                    timestamp=_get_timestamp()
                 )
         except Exception as e:
             logger.error(f"Error normalizing tick: {e}")

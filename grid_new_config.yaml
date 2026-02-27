@@ -1,0 +1,82 @@
+# MES-M2K Bounded Spread Grid Strategy Configuration
+
+# Trading Instruments
+mes_symbol: MES
+m2k_symbol: M2K
+
+# Strategy Parameters
+entry_levels: [1.3, 1.8]
+max_layers: 2
+max_abs_z: 2.2
+reentry_cooldown_sec: 60
+mes_units_per_layer: 1
+size_scale: 1.0
+z_takeprofit: 0.7
+z_mid: 0.0
+z_stop: 2.2
+max_hold_seconds: 720
+
+# Beta + Spread Stats
+beta_window_minutes: 60
+beta_min: 0.5
+beta_max: 1.5
+spread_window_minutes: 120
+min_spread_std: 0.01
+
+# Regime Filters
+corr_window: 60
+corr_min: 0.4
+trend_window: 20
+trend_threshold: 4.0
+vol_window: 60
+vol_threshold: 0.015
+
+dll_amount: 1100
+dll_buffer: 200
+mll_buffer: 350
+daily_profit_target: 700
+max_daily_trades: 50
+max_daily_entries: 20
+max_gross_contracts_mes: 5
+max_gross_contracts_m2k: 10
+max_net_notional: 10000
+fees_per_contract: 0.0
+mll_mode: end_of_day
+eod_cutoff_time_ct: "15:00"
+
+# Time Windows (CT)
+session_start: "08:30"
+session_end: "15:00"
+disable_after_open_minutes: 5
+disable_before_close_minutes: 5
+macro_no_trade_windows: []
+
+# Data + Safety
+data_stall_seconds: 10
+reconcile_interval_seconds: 30
+account_poll_seconds: 15
+order_reject_limit: 3
+entry_fill_timeout_sec: 5
+entry_order_check_seconds: 2
+flatten_order_type: close_position  # close_position | market | aggressive_limit
+exit_order_type: aggressive_limit   # aggressive_limit | market | limit
+aggressive_limit_ticks: 2
+
+# Tick sizes
+mes_tick_size: 0.25
+m2k_tick_size: 0.25
+
+# Tick values (fallback if API P&L unavailable)
+mes_tick_value: 1.25
+m2k_tick_value: 0.5
+
+# TopstepX API
+api_base_url: https://api.topstepx.com
+user_hub_url: https://rtc.topstepx.com/hubs/user
+market_hub_url: https://rtc.topstepx.com/hubs/market
+
+# Trading Mode
+dry_run: true
+prefer_practice_account: true
+account_id: null
+

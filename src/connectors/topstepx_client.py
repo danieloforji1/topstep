@@ -311,16 +311,44 @@ class TopstepXClient:
             "includePartialBar": False
         }
         
-        try:
-            response = self._session.post(url, json=payload, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("success") and "bars" in data:
-                return data["bars"]
-            return []
-        except Exception as e:
-            logger.error(f"Error fetching bars: {e}")
-            return []
+        # Calculate dynamic timeout based on limit
+        # Base timeout: 10 seconds for 100 bars
+        # Scale up: ~0.01 seconds per bar, minimum 10s, maximum 60s
+        base_timeout = 10
+        timeout = max(base_timeout, min(60, base_timeout + (limit * 0.01)))
+        
+        # For very large requests (2000+ bars), use longer timeout and retry logic
+        max_retries = 3 if limit > 1000 else 1
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                response = self._session.post(url, json=payload, timeout=timeout)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("success") and "bars" in data:
+                    return data["bars"]
+                return []
+            except (requests.exceptions.Timeout, requests.Timeout) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Timeout fetching bars (attempt {attempt + 1}/{max_retries}, "
+                        f"limit={limit}, timeout={timeout}s). Retrying in {retry_delay}s..."
+                    )
+                    time.sleep(retry_delay)
+                    # Increase timeout for retry
+                    timeout = min(120, timeout * 1.5)
+                    retry_delay *= 2
+                else:
+                    logger.error(f"Error fetching bars: Timeout after {max_retries} attempts (limit={limit}, timeout={timeout}s)")
+                    return []
+            except Exception as e:
+                # For non-timeout errors, don't retry (might be auth, network, etc.)
+                if attempt == 0:  # Only log on first attempt
+                    logger.error(f"Error fetching bars: {e}")
+                return []
+        
+        return []
     
     def place_order(
         self,
@@ -821,6 +849,10 @@ class TopstepXClient:
         
         logger.debug(f"Market quote update for contract {contract_id}: {data}")
         
+        # Ensure callback can match updates by contract ID.
+        if contract_id and isinstance(data, dict) and "contractId" not in data:
+            data["contractId"] = contract_id
+        
         # Pass data to callback
         if "on_quote_update" in self.realtime_callbacks:
             self.realtime_callbacks["on_quote_update"](data)
@@ -860,6 +892,10 @@ class TopstepXClient:
             return
         
         logger.debug(f"Market trade update for contract {contract_id}: {data}")
+        
+        # Ensure callback can match updates by contract ID.
+        if contract_id and isinstance(data, dict) and "contractId" not in data:
+            data["contractId"] = contract_id
         
         # Pass data to callback
         if "on_market_trade_update" in self.realtime_callbacks:

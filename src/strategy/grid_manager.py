@@ -293,7 +293,12 @@ class GridManager:
                 logger.info(f"Grid fill: {grid_order.level.side} {quantity} @ {price:.2f}")
                 return grid_order.level
         
-        logger.warning(f"Fill for unknown order: {order_id}")
+        # Fill for order not tracked in grid_manager - this can happen if:
+        # 1. Order was from previous session
+        # 2. Manual order placed outside strategy
+        # 3. Order was placed but not properly registered
+        # Log as debug (not warning) since position_manager will still track it via API reconciliation
+        logger.debug(f"Fill for order not in grid_manager tracking: {order_id} (position_manager will track via API)")
         return None
     
     def cancel_all_orders(self) -> List[str]:

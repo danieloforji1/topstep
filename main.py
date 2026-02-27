@@ -8,6 +8,7 @@ import time
 import logging
 import yaml
 from datetime import datetime, timedelta
+from collections import deque
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
@@ -20,7 +21,7 @@ from data.timeseries_store import TimeseriesStore
 from data.trade_history import TradeHistory
 from data.state_persistence import StatePersistence
 from data.analytics_store import AnalyticsStore
-from indicators.technical import calculate_atr, calculate_volatility, calculate_correlation
+from indicators.technical import calculate_atr, calculate_volatility, calculate_correlation, calculate_trend_strength
 from strategy.grid_manager import GridManager
 from strategy.position_manager import PositionManager
 from strategy.risk_manager import RiskManager
@@ -126,7 +127,9 @@ class GridStrategy:
         
         self.position_manager = PositionManager(
             max_net_notional=self.config.get('max_net_notional', 1200.0),
-            tick_values={self.primary_symbol: 5.0, self.hedge_symbol: 2.0}
+            tick_values={self.primary_symbol: 5.0, self.hedge_symbol: 2.0},
+            tick_sizes={self.primary_symbol: 0.25, self.hedge_symbol: 0.25},  # MES/MNQ tick size
+            contract_multipliers={self.primary_symbol: 5.0, self.hedge_symbol: 2.0}  # CRITICAL: MES=5, MNQ=2 (not 100!)
         )
         
         self.risk_manager = RiskManager(
@@ -181,12 +184,151 @@ class GridStrategy:
         # Current prices
         self.current_price: Optional[float] = None
         self.hedge_price: Optional[float] = None
+        self.current_price_ts: Optional[datetime] = None
+        self.hedge_price_ts: Optional[datetime] = None
+        
+        # Fill processing safeguards:
+        # 1) Only process newly-filled orders (status transition -> Filled)
+        # 2) Deduplicate fills to prevent replay-driven double counting
+        self._fill_tracking_initialized = False
+        self._order_status_cache: Dict[str, Any] = {}
+        self._processed_fill_keys = set()
+        self._processed_fill_queue = deque()
+        self._processed_fill_cache_limit = 5000
+        self._last_fill_poll: Optional[datetime] = None
         
         logger.info(f"Grid Strategy initialized (dry_run={self.dry_run})")
         if not self.dry_run:
             logger.warning("=" * 60)
             logger.warning("LIVE TRADING MODE ENABLED - REAL ORDERS WILL BE PLACED!")
             logger.warning("=" * 60)
+    
+    def _normalize_identifier(self, value: Any) -> str:
+        """Normalize instrument identifiers for robust matching."""
+        if value is None:
+            return ""
+        return str(value).strip().upper()
+    
+    def _is_update_for_symbol(self, data: Dict[str, Any], symbol: str, contract_id: Optional[str]) -> bool:
+        """Match realtime payloads by contract ID and common symbol aliases."""
+        candidates = {
+            self._normalize_identifier(data.get("symbol")),
+            self._normalize_identifier(data.get("symbolId")),
+            self._normalize_identifier(data.get("contractId")),
+            self._normalize_identifier(data.get("contract")),
+            self._normalize_identifier(data.get("instrument")),
+        }
+        candidates.discard("")
+        
+        aliases = {
+            self._normalize_identifier(symbol),
+            self._normalize_identifier(f"F.US.{symbol}"),
+            self._normalize_identifier(f"/{symbol}"),
+        }
+        if contract_id:
+            normalized_contract = self._normalize_identifier(contract_id)
+            aliases.add(normalized_contract)
+            contract_parts = normalized_contract.split(".")
+            if len(contract_parts) >= 4:
+                aliases.add(contract_parts[3])  # MES / MNQ symbol component
+        
+        for candidate in candidates:
+            if candidate in aliases:
+                return True
+            for alias in aliases:
+                # Require delimiter-based suffix matches to avoid false matches like ".H26"
+                # across different symbols (MES vs MNQ).
+                if alias and (
+                    candidate.endswith(f".{alias}") or
+                    candidate.endswith(f"/{alias}") or
+                    candidate.endswith(f":{alias}")
+                ):
+                    return True
+        return False
+    
+    def _is_risk_reducing_hedge(self, primary_position: int, hedge_size: int) -> bool:
+        """
+        A hedge order is risk-reducing only if it is opposite the primary exposure:
+        - primary long (>0) => hedge should be SELL (<0)
+        - primary short (<0) => hedge should be BUY (>0)
+        """
+        if primary_position == 0 or hedge_size == 0:
+            return False
+        return (primary_position > 0 and hedge_size < 0) or (primary_position < 0 and hedge_size > 0)
+    
+    def _update_primary_price(self, price: float):
+        self.current_price = float(price)
+        self.current_price_ts = datetime.now()
+        self.position_manager.update_price(self.primary_symbol, self.current_price)
+    
+    def _update_hedge_price(self, price: float):
+        self.hedge_price = float(price)
+        self.hedge_price_ts = datetime.now()
+        self.position_manager.update_price(self.hedge_symbol, self.hedge_price)
+    
+    def _is_price_fresh(self, symbol: str) -> bool:
+        max_staleness = float(self.config.get("max_price_staleness_seconds", 5))
+        now = datetime.now()
+        if symbol == self.primary_symbol:
+            if self.current_price is None or self.current_price_ts is None:
+                return False
+            return (now - self.current_price_ts).total_seconds() <= max_staleness
+        if symbol == self.hedge_symbol:
+            if self.hedge_price is None or self.hedge_price_ts is None:
+                return False
+            return (now - self.hedge_price_ts).total_seconds() <= max_staleness
+        return False
+    
+    def _enforce_position_limits(self) -> bool:
+        """
+        Hard-enforce max position size. Returns True if protective action was taken.
+        """
+        if not getattr(self, "max_position_size", None):
+            return False
+        
+        primary_position = self.position_manager.get_net_position(self.primary_symbol)
+        hedge_position = self.position_manager.get_net_position(self.hedge_symbol)
+        total_pos = abs(primary_position) + abs(hedge_position)
+        
+        if total_pos <= self.max_position_size:
+            return False
+        
+        logger.critical(
+            f"🚨 POSITION LIMIT BREACH: total={total_pos}, limit={self.max_position_size}, "
+            f"primary={primary_position}, hedge={hedge_position}. Taking protective action."
+        )
+        
+        # Step 1: cancel all known open grid orders to prevent further fills
+        try:
+            order_ids = self.grid_manager.cancel_all_orders()
+            if order_ids:
+                self.order_client.cancel_all_orders(order_ids)
+        except Exception as e:
+            logger.warning(f"Could not cancel grid orders during limit enforcement: {e}")
+        
+        # Step 2: reduce primary position down to allowed quantity accounting for hedge
+        allowed_primary_abs = max(0, self.max_position_size - abs(hedge_position))
+        excess_primary = max(0, abs(primary_position) - allowed_primary_abs)
+        
+        if excess_primary > 0 and self.primary_contract_id:
+            reduce_side = "BUY" if primary_position < 0 else "SELL"
+            logger.critical(
+                f"Reducing primary exposure by {excess_primary} contracts "
+                f"({reduce_side}) to enforce max_position_size."
+            )
+            self.order_client.place_market_order(
+                contract_id=self.primary_contract_id,
+                side=reduce_side,
+                quantity=excess_primary
+            )
+            return True
+        
+        # Fallback: if still breached and no clear reduction path, flatten for safety.
+        if total_pos > self.max_position_size:
+            self.emergency_flatten("Position limit breach fallback")
+            return True
+        
+        return False
     
     def initialize(self) -> bool:
         """Initialize connection and fetch contract info"""
@@ -535,9 +677,8 @@ class GridStrategy:
                     return
                 
                 # Update current price for primary instrument
-                if symbol_id == primary_symbol_id:
-                    self.current_price = float(last_price)
-                    self.position_manager.update_price(self.primary_symbol, self.current_price)
+                if symbol_id == primary_symbol_id or self._is_update_for_symbol(data, self.primary_symbol, self.primary_contract_id):
+                    self._update_primary_price(float(last_price))
                     
                     # Feed order flow data if analyzer is enabled
                     if self.order_flow_analyzer:
@@ -557,9 +698,8 @@ class GridStrategy:
                     logger.debug(f"Updated {self.primary_symbol} price: {self.current_price:.2f}")
                 
                 # Update current price for hedge instrument
-                elif symbol_id == hedge_symbol_id:
-                    self.hedge_price = float(last_price)
-                    self.position_manager.update_price(self.hedge_symbol, self.hedge_price)
+                elif symbol_id == hedge_symbol_id or self._is_update_for_symbol(data, self.hedge_symbol, self.hedge_contract_id):
+                    self._update_hedge_price(float(last_price))
                     logger.debug(f"Updated {self.hedge_symbol} price: {self.hedge_price:.2f}")
                 
                 # Also try to match by contract ID if symbol doesn't match
@@ -567,8 +707,7 @@ class GridStrategy:
                 if not self.current_price and self.primary_contract_id:
                     # Try to infer from contract ID or use lastPrice if it's the only quote
                     if not self.current_price:
-                        self.current_price = float(last_price)
-                        self.position_manager.update_price(self.primary_symbol, self.current_price)
+                        self._update_primary_price(float(last_price))
                         
             except Exception as e:
                 logger.error(f"Error processing quote update: {e}")
@@ -596,12 +735,10 @@ class GridStrategy:
                     return
                 
                 # Update price from trade data
-                if symbol_id == primary_symbol_id or not self.current_price:
-                    self.current_price = float(price)
-                    self.position_manager.update_price(self.primary_symbol, self.current_price)
-                elif symbol_id == hedge_symbol_id:
-                    self.hedge_price = float(price)
-                    self.position_manager.update_price(self.hedge_symbol, self.hedge_price)
+                if symbol_id == primary_symbol_id or self._is_update_for_symbol(data, self.primary_symbol, self.primary_contract_id) or not self.current_price:
+                    self._update_primary_price(float(price))
+                elif symbol_id == hedge_symbol_id or self._is_update_for_symbol(data, self.hedge_symbol, self.hedge_contract_id):
+                    self._update_hedge_price(float(price))
                     
             except Exception as e:
                 logger.error(f"Error processing trade update: {e}")
@@ -630,6 +767,15 @@ class GridStrategy:
         if atr:
             logger.debug(f"ATR: {atr:.2f}")
             MetricsExporter.update_atr(self.primary_symbol, atr)
+        
+        # Calculate trend strength (ATR-normalized move)
+        trend_strength = calculate_trend_strength(
+            primary_candles,
+            window=self.config.get('trend_window', 20),
+            atr_window=self.config.get('atr_window', 14)
+        )
+        if trend_strength is not None:
+            self._last_trend_strength = trend_strength
         
         # Calculate volatility
         vol_window = self.config.get('volatility_window', 100)
@@ -676,6 +822,12 @@ class GridStrategy:
             if correlation is not None:
                 self._last_correlation = correlation
             
+            # CRITICAL: Update hedge manager with correlation and volatilities
+            if correlation is not None:
+                self.hedge_manager.update_correlation(correlation)
+            if primary_vol is not None and hedge_vol is not None:
+                self.hedge_manager.update_volatilities(primary_vol, hedge_vol)
+            
             # Update grid if needed (with volatility for adaptive density)
             grid_rebuilt = False
             if self.current_price:
@@ -720,9 +872,30 @@ class GridStrategy:
     
     def _place_grid_orders(self):
         """Place orders for grid levels"""
+        if not self._is_price_fresh(self.primary_symbol):
+            logger.warning("Primary price is stale; skipping grid order placement this cycle")
+            return
+        
         levels = self.grid_manager.get_levels_to_place()
         
+        # CRITICAL: Reconcile positions with API FIRST to get accurate current positions
+        # This ensures we're using API as source of truth, not stale internal tracking
+        if not self.dry_run and self.api_client.account_id:
+            try:
+                api_positions = self.api_client.get_positions(self.api_client.account_id)
+                if api_positions is not None:  # Empty list is valid (no positions)
+                    self.position_manager.reconcile_with_api_positions(api_positions)
+                    logger.debug(f"Reconciled positions before grid order placement: {len(api_positions)} positions from API")
+            except Exception as e:
+                logger.debug(f"Error reconciling positions before grid orders: {e}")
+        
+        # Hard position limit enforcement before any new placement
+        if self._enforce_position_limits():
+            logger.warning("Position limit enforcement triggered; skipping new grid orders this cycle")
+            return
+        
         # Check current total position size (for 50k challenge: max 5 contracts)
+        # Now using reconciled positions from API (source of truth)
         if hasattr(self, 'max_position_size') and self.max_position_size:
             primary_pos = abs(self.position_manager.get_net_position(self.primary_symbol))
             hedge_pos = abs(self.position_manager.get_net_position(self.hedge_symbol))
@@ -735,6 +908,18 @@ class GridStrategy:
                 )
                 return  # Don't place new orders if at limit
         
+        working_primary_qty = 0
+        if not self.dry_run and self.api_client.account_id:
+            try:
+                open_orders = self.api_client.get_open_orders(self.api_client.account_id)
+                working_primary_qty = sum(
+                    int(o.get("size") or 0)
+                    for o in open_orders
+                    if self._normalize_identifier(o.get("contractId")) == self._normalize_identifier(self.primary_contract_id)
+                )
+            except Exception as e:
+                logger.debug(f"Could not fetch open orders for working exposure check: {e}")
+        
         for level in levels:
             if not self.primary_contract_id:
                 continue
@@ -743,7 +928,7 @@ class GridStrategy:
             if hasattr(self, 'max_position_size') and self.max_position_size:
                 primary_pos = abs(self.position_manager.get_net_position(self.primary_symbol))
                 hedge_pos = abs(self.position_manager.get_net_position(self.hedge_symbol))
-                projected_total = primary_pos + hedge_pos + level.size
+                projected_total = primary_pos + hedge_pos + working_primary_qty + level.size
                 
                 if projected_total > self.max_position_size:
                     logger.warning(
@@ -761,6 +946,7 @@ class GridStrategy:
             
             if order_id:
                 self.grid_manager.register_order(level, order_id)
+                working_primary_qty += level.size
                 MetricsExporter.record_order(self.primary_symbol, level.side, "placed")
                 
                 # Record order event for analytics
@@ -806,207 +992,398 @@ class GridStrategy:
                 # Save state after placing order
                 self.grid_manager.save_state()
     
-    def _check_and_place_hedge(self):
-        """Check if hedge should be activated and place if needed"""
-        if not self.hedge_contract_id or not self.current_price:
+    def _close_hedge_position(self, hedge_position: int, reason: str):
+        """Close any open hedge position"""
+        if hedge_position == 0 or not self.hedge_contract_id:
             return
         
-        # Cooldown: Don't check hedge more than once every 10 seconds
+        # Avoid duplicate unwind orders
+        if not self.dry_run and self.api_client.account_id:
+            try:
+                api_orders = self.api_client.get_open_orders(self.api_client.account_id)
+                open_hedge_orders = [
+                    o for o in api_orders
+                    if self._normalize_identifier(o.get('contractId')) == self._normalize_identifier(self.hedge_contract_id)
+                ]
+                if open_hedge_orders:
+                    logger.debug("Existing hedge orders found, skipping hedge unwind")
+                    return
+            except Exception as e:
+                logger.debug(f"Could not check open hedge orders for unwind: {e}")
+        
+        hedge_side = "BUY" if hedge_position < 0 else "SELL"
+        quantity = abs(hedge_position)
+        price = self.hedge_price or self.current_price
+        
+        if price is None:
+            return
+        
+        order_id = self.order_client.place_limit_order(
+            contract_id=self.hedge_contract_id,
+            side=hedge_side,
+            quantity=quantity,
+            price=price
+        )
+        
+        if order_id:
+            logger.info(f"Unwinding hedge: {hedge_side} {quantity} {self.hedge_symbol} ({reason})")
+            MetricsExporter.record_order(self.hedge_symbol, hedge_side, "placed")
+            self._hedge_cooldown_until = datetime.now() + timedelta(
+                seconds=self.config.get('hedge_cooldown_seconds', 120)
+            )
+            
+            self.analytics_store.record_strategy_decision(
+                decision_type="hedge_unwind",
+                symbol=self.hedge_symbol,
+                decision_data={
+                    "order_id": str(order_id),
+                    "side": hedge_side,
+                    "quantity": quantity,
+                    "price": price,
+                    "reason": reason
+                },
+                market_conditions={
+                    "atr": getattr(self, '_last_atr', None),
+                    "volatility": getattr(self, '_last_volatility', None),
+                    "correlation": getattr(self, '_last_correlation', None),
+                    "current_price": self.current_price,
+                    "hedge_price": self.hedge_price,
+                    "grid_mid": self.grid_manager.grid_mid,
+                    "spacing": self.grid_manager.spacing
+                },
+                reasoning=f"Hedge unwind: {reason}"
+            )
+    
+    def _check_and_place_hedge(self):
+        """Check if hedge should be activated and place if needed"""
+        if not self.hedge_contract_id or not self.current_price or not self.hedge_price:
+            return
+        if not self._is_price_fresh(self.primary_symbol) or not self._is_price_fresh(self.hedge_symbol):
+            logger.warning("Primary/hedge price stale; skipping hedge check")
+            return
+        
+        # Cooldown: Don't check hedge more than once every 5 seconds (reduced for faster response)
         # This prevents rapid-fire hedge orders
         if not hasattr(self, '_last_hedge_check'):
             self._last_hedge_check = datetime.now()
         
         time_since_last_check = (datetime.now() - self._last_hedge_check).total_seconds()
-        if time_since_last_check < 10:
+        if time_since_last_check < 5:  # Reduced from 10 to 5 seconds
             return  # Still in cooldown
         
         self._last_hedge_check = datetime.now()
         
-        net_exposure = self.position_manager.net_exposure_dollars()
-        primary_position = self.position_manager.get_net_position(self.primary_symbol)
-        
-        if primary_position == 0:
+        # Extended cooldown after hedge actions (reduce churn)
+        hedge_cooldown_seconds = self.config.get('hedge_cooldown_seconds', 120)
+        if hasattr(self, '_hedge_cooldown_until') and datetime.now() < self._hedge_cooldown_until:
             return
         
-        # Check if hedge should be activated
+        net_exposure = self.position_manager.net_exposure_dollars()
+        primary_position = self.position_manager.get_net_position(self.primary_symbol)
+        existing_hedge_position = self.position_manager.get_net_position(self.hedge_symbol)
+        
+        # If no primary position but hedge exists, unwind hedge
+        if primary_position == 0:
+            if existing_hedge_position != 0:
+                self._close_hedge_position(existing_hedge_position, reason="No primary position")
+            return
+        
         spacing = self.grid_manager.spacing or 0
         grid_mid = self.grid_manager.grid_mid or self.current_price
+        if spacing <= 0:
+            return
         
-        should_hedge = self.hedge_manager.should_activate_hedge(
-            net_exposure,
-            spacing,
-            self.current_price,
-            grid_mid,
-            self.config.get('hedge_activation_multiplier', 1.5)
+        price_move_grid = abs(self.current_price - grid_mid)
+        activation_multiplier = self.config.get('hedge_activation_multiplier', 0.8)
+        unwind_multiplier = self.config.get('hedge_unwind_multiplier', 0.5)
+        activation_threshold = spacing * activation_multiplier
+        
+        primary_pos_obj = self.position_manager.get_position(self.primary_symbol)
+        avg_entry_price = primary_pos_obj.avg_price if primary_pos_obj and primary_pos_obj.quantity != 0 else self.current_price
+        adverse_move_from_entry = 0.0
+        if primary_position > 0:
+            adverse_move_from_entry = max(0.0, avg_entry_price - self.current_price)
+        elif primary_position < 0:
+            adverse_move_from_entry = max(0.0, self.current_price - avg_entry_price)
+        effective_price_move = max(price_move_grid, adverse_move_from_entry)
+        
+        # Get unrealized P&L for profit protection
+        unrealized_pnl = self.position_manager.get_unrealized_pnl(self.primary_symbol)
+        profit_protection_enabled = self.config.get('hedge_profit_protection_enabled', True)
+        profit_protection_threshold = self.config.get('hedge_profit_protection_threshold', 50.0)
+        
+        # Hedge only when price is on the "dangerous" side of grid mid
+        dangerous_side_grid = (
+            (primary_position > 0 and self.current_price < grid_mid) or
+            (primary_position < 0 and self.current_price > grid_mid)
+        )
+        dangerous_side = dangerous_side_grid or adverse_move_from_entry > 0
+        
+        # Profit protection: Hedge earlier when profitable and price moves against
+        # If we have unrealized profits and price is moving against us, use lower threshold
+        in_profit = unrealized_pnl > profit_protection_threshold
+        profit_protection_active = profit_protection_enabled and in_profit and dangerous_side
+        
+        # Use more aggressive threshold when profit protection is active
+        if profit_protection_active:
+            # Hedge at 0.5x spacing when profitable (much faster)
+            profit_protection_threshold_mult = 0.5
+            effective_threshold = spacing * profit_protection_threshold_mult
+            logger.info(
+                f"💰 PROFIT PROTECTION ACTIVE: unrealized_pnl=${unrealized_pnl:.2f}, "
+                f"using aggressive threshold={effective_threshold:.2f} (0.5x spacing)"
+            )
+        else:
+            effective_threshold = activation_threshold
+        
+        # Log hedge check diagnostics
+        correlation = self.hedge_manager.current_correlation
+        correlation_healthy = self.hedge_manager.is_correlation_healthy()
+        correlation_str = f"{correlation:.3f}" if correlation is not None else "None"
+        logger.info(
+            f"🔍 HEDGE CHECK: price={self.current_price:.2f}, grid_mid={grid_mid:.2f}, "
+            f"spacing={spacing:.2f}, price_move_grid={price_move_grid:.2f}, "
+            f"adverse_move_entry={adverse_move_from_entry:.2f}, effective_move={effective_price_move:.2f}, "
+            f"activation_threshold={effective_threshold:.2f} ({activation_multiplier if not profit_protection_active else 0.5}x), "
+            f"primary_pos={primary_position}, dangerous_side={dangerous_side}, dangerous_side_grid={dangerous_side_grid}, "
+            f"unrealized_pnl=${unrealized_pnl:.2f}, profit_protection={profit_protection_active}, "
+            f"correlation={correlation_str}, "
+            f"correlation_healthy={correlation_healthy}"
         )
         
-        if should_hedge:
-            # CRITICAL: Reconcile positions FIRST to get accurate current positions
-            # This prevents placing hedge orders based on stale position data
-            if not self.dry_run and self.api_client.account_id:
-                try:
-                    api_positions = self.api_client.get_positions(self.api_client.account_id)
-                    if api_positions:
-                        self.position_manager.reconcile_with_api_positions(api_positions)
-                        logger.debug(f"Reconciled positions before hedge check: {len(api_positions)} positions")
-                except Exception as e:
-                    logger.debug(f"Could not reconcile positions before hedge check: {e}")
-            
-            # Check existing hedge position (after reconciliation)
-            existing_hedge_position = self.position_manager.get_net_position(self.hedge_symbol)
-            logger.info(f"Current hedge position check: {self.hedge_symbol} = {existing_hedge_position} contracts")
-            
-            # Check for existing open hedge orders to avoid duplicate orders
-            api_orders = []
-            try:
-                api_orders = self.api_client.get_open_orders(self.api_client.account_id)
-            except Exception as e:
-                logger.debug(f"Could not check open orders: {e}")
-            
-            # Count open hedge orders
-            open_hedge_orders = [
-                o for o in api_orders 
-                if o.get('contractId') == self.hedge_contract_id or 
-                   str(o.get('contractId', '')).endswith(self.hedge_symbol)
-            ]
-            
-            if open_hedge_orders:
-                logger.debug(f"Found {len(open_hedge_orders)} existing hedge orders, skipping new hedge placement")
-                return  # Don't place duplicate hedge orders
-            
-            # Get tick values for proper risk-based sizing
-            primary_tick_value = self.position_manager.tick_values.get(self.primary_symbol, 5.0)
-            hedge_tick_value = self.position_manager.tick_values.get(self.hedge_symbol, 2.0)
-            
-            # Get current volatilities and correlation for risk-based hedge calculation
-            # These are already stored in hedge_manager, but pass explicitly for clarity
-            primary_vol = self.hedge_manager.primary_volatility
-            hedge_vol = self.hedge_manager.hedge_volatility
-            correlation = self.hedge_manager.current_correlation
-            
-            # Compute target hedge size based on RISK exposure (accounts for volatility differences)
-            # This properly hedges drawdowns by matching risk, not just dollar exposure
-            target_hedge_size = self.hedge_manager.compute_hedge_size(
-                primary_position=primary_position,
-                primary_price=self.current_price,
-                hedge_price=self.hedge_price,
-                primary_tick_value=primary_tick_value,
-                hedge_tick_value=hedge_tick_value,
-                primary_volatility=primary_vol,
-                hedge_volatility=hedge_vol,
-                correlation=correlation
+        # Unwind hedge when price mean-reverts
+        if existing_hedge_position != 0:
+            should_unwind = (
+                effective_price_move <= (spacing * unwind_multiplier) or
+                not dangerous_side
             )
-            
-            # Calculate how much hedge we need to ADD (account for existing position)
-            # target_hedge_size is the total desired position (opposite of primary)
-            # existing_hedge_position is what we currently have
-            # hedge_needed = target_hedge_size - existing_hedge_position
-            
-            # CRITICAL CHECK: If existing hedge is already at or above target, don't add more
-            # Both should be negative (short) if primary is long, or both positive if primary is short
-            if (primary_position > 0 and existing_hedge_position <= target_hedge_size) or \
-               (primary_position < 0 and existing_hedge_position >= target_hedge_size):
-                logger.info(
-                    f"Hedge already adequate or over-hedged: primary={primary_position}, "
-                    f"existing_hedge={existing_hedge_position}, target_hedge={target_hedge_size}. "
-                    f"Skipping hedge order."
+            if should_unwind:
+                logger.info(f"🔄 Unwinding hedge: effective_move={effective_price_move:.2f} <= {spacing * unwind_multiplier:.2f} or not dangerous_side")
+                self._close_hedge_position(
+                    existing_hedge_position,
+                    reason="Unwind conditions met"
                 )
-                return  # Don't place hedge order if already hedged enough
+                return
+        
+        # Activation gate - use effective threshold (lower when profit protection active)
+        should_hedge = (
+            effective_price_move >= effective_threshold and
+            dangerous_side
+        )
+        
+        if not should_hedge:
+            logger.info(
+                f"❌ Hedge NOT triggered: effective_move={effective_price_move:.2f} < threshold={effective_threshold:.2f} "
+                f"OR not dangerous_side={dangerous_side}"
+            )
+            return
+        
+        if not correlation_healthy:
+            logger.warning(
+                f"❌ Hedge blocked: Correlation not healthy. "
+                f"correlation={correlation:.3f if correlation else None}, "
+                f"threshold={self.hedge_manager.correlation_threshold:.2f}"
+            )
+            return
+        
+        logger.info(f"✅ Hedge conditions MET: proceeding to compute hedge size...")
+        
+        # CRITICAL: Reconcile positions FIRST to get accurate current positions
+        # This prevents placing hedge orders based on stale position data
+        if not self.dry_run and self.api_client.account_id:
+            try:
+                api_positions = self.api_client.get_positions(self.api_client.account_id)
+                if api_positions:
+                    self.position_manager.reconcile_with_api_positions(api_positions)
+                    logger.debug(f"Reconciled positions before hedge check: {len(api_positions)} positions")
+            except Exception as e:
+                logger.debug(f"Could not reconcile positions before hedge check: {e}")
+        
+        # Check existing hedge position (after reconciliation)
+        existing_hedge_position = self.position_manager.get_net_position(self.hedge_symbol)
+        logger.info(f"Current hedge position check: {self.hedge_symbol} = {existing_hedge_position} contracts")
+        
+        # Check for existing open hedge orders to avoid duplicate orders
+        api_orders = []
+        try:
+            api_orders = self.api_client.get_open_orders(self.api_client.account_id)
+        except Exception as e:
+            logger.debug(f"Could not check open orders: {e}")
+        
+        # Count open hedge orders
+        open_hedge_orders = [
+            o for o in api_orders 
+            if self._normalize_identifier(o.get('contractId')) == self._normalize_identifier(self.hedge_contract_id)
+        ]
+        
+        if open_hedge_orders:
+            logger.debug(f"Found {len(open_hedge_orders)} existing hedge orders, skipping new hedge placement")
+            return  # Don't place duplicate hedge orders
+        
+        # Get tick values for proper risk-based sizing
+        primary_tick_value = self.position_manager.tick_values.get(self.primary_symbol, 5.0)
+        hedge_tick_value = self.position_manager.tick_values.get(self.hedge_symbol, 2.0)
+        
+        # Get current volatilities and correlation for risk-based hedge calculation
+        # These are already stored in hedge_manager, but pass explicitly for clarity
+        primary_vol = self.hedge_manager.primary_volatility
+        hedge_vol = self.hedge_manager.hedge_volatility
+        correlation = self.hedge_manager.current_correlation
+        
+        # Compute target hedge size based on RISK exposure (accounts for volatility differences)
+        # This properly hedges drawdowns by matching risk, not just dollar exposure
+        target_hedge_size = self.hedge_manager.compute_hedge_size(
+            primary_position=primary_position,
+            primary_price=self.current_price,
+            hedge_price=self.hedge_price,
+            primary_tick_value=primary_tick_value,
+            hedge_tick_value=hedge_tick_value,
+            primary_volatility=primary_vol,
+            hedge_volatility=hedge_vol,
+            correlation=correlation
+        )
+        
+        if target_hedge_size == 0:
+            return
+        
+        # Apply partial hedge + trend filter
+        hedge_fraction = self.config.get('hedge_fraction_of_primary', 0.5)
+        max_fraction = self.config.get('hedge_max_fraction_of_primary', 1.0)
+        trend_threshold = self.config.get('hedge_trend_threshold', 2.0)
+        trend_reduce_factor = self.config.get('hedge_trend_reduce_factor', 0.3)
+        
+        trend_strength = abs(getattr(self, '_last_trend_strength', 0.0))
+        trend_factor = trend_reduce_factor if trend_strength >= trend_threshold else 1.0
+        
+        scaled_target = int(round(target_hedge_size * hedge_fraction * trend_factor))
+        if scaled_target == 0:
+            return
+        
+        # Cap hedge to a fraction of primary position
+        max_hedge = int(round(abs(primary_position) * max_fraction))
+        if abs(scaled_target) > max_hedge:
+            scaled_target = max_hedge if scaled_target > 0 else -max_hedge
+        
+        target_hedge_size = scaled_target
+        
+        # Calculate how much hedge we need to ADD (account for existing position)
+        # target_hedge_size is the total desired position (opposite of primary)
+        # existing_hedge_position is what we currently have
+        # hedge_needed = target_hedge_size - existing_hedge_position
+        
+        # CRITICAL CHECK: If existing hedge is already at or above target, don't add more
+        # Both should be negative (short) if primary is long, or both positive if primary is short
+        if (primary_position > 0 and existing_hedge_position <= target_hedge_size) or \
+           (primary_position < 0 and existing_hedge_position >= target_hedge_size):
+            logger.info(
+                f"Hedge already adequate or over-hedged: primary={primary_position}, "
+                f"existing_hedge={existing_hedge_position}, target_hedge={target_hedge_size}. "
+                f"Skipping hedge order."
+            )
+            return  # Don't place hedge order if already hedged enough
+        
+        hedge_needed = target_hedge_size - existing_hedge_position
+        
+        # CRITICAL: Cap hedge_needed to prevent oversized adjustments
+        # Never adjust by more than the primary position size
+        max_adjustment = abs(primary_position) * self.hedge_manager.max_hedge_contracts_multiplier
+        if abs(hedge_needed) > max_adjustment:
+            logger.error(
+                f"🚨 CRITICAL: Hedge adjustment ({hedge_needed}) exceeds max adjustment ({max_adjustment}). "
+                f"CAPPING adjustment to {max_adjustment} contracts."
+            )
+            hedge_needed = max_adjustment if hedge_needed > 0 else -max_adjustment
+        
+        # Additional safety: Never adjust by more than primary position itself
+        if abs(hedge_needed) > abs(primary_position):
+            logger.error(
+                f"🚨 CRITICAL: Hedge adjustment ({hedge_needed}) exceeds primary position ({primary_position}). "
+                f"CAPPING to primary position size."
+            )
+            hedge_needed = abs(primary_position) if hedge_needed > 0 else -abs(primary_position)
+        
+        # Final safety check: Ensure total hedge position (after adjustment) never exceeds primary
+        # This prevents accumulation of oversized hedges
+        projected_total_hedge = abs(existing_hedge_position + hedge_needed)
+        max_allowed_hedge = abs(primary_position) * self.hedge_manager.max_hedge_contracts_multiplier
+        
+        if projected_total_hedge > max_allowed_hedge:
+            # Calculate maximum allowed adjustment
+            max_allowed_adjustment = max_allowed_hedge - abs(existing_hedge_position)
+            if max_allowed_adjustment < 0:
+                max_allowed_adjustment = 0  # Already over-hedged, don't add more
             
-            hedge_needed = target_hedge_size - existing_hedge_position
+            logger.error(
+                f"🚨 CRITICAL: Projected total hedge ({projected_total_hedge}) exceeds max ({max_allowed_hedge}). "
+                f"Limiting adjustment to {max_allowed_adjustment} contracts."
+            )
+            # Cap the adjustment to keep total hedge within limits
+            hedge_needed = max_allowed_adjustment if hedge_needed > 0 else -max_allowed_adjustment
+        
+        # Only place order if we need to adjust the hedge
+        hedge_size = 0  # Default: no hedge order needed
+        if abs(hedge_needed) > 0:
+            # Limit the order size to what's actually needed
+            # Never place an order larger than the difference
+            hedge_size = hedge_needed
             
-            # CRITICAL: Cap hedge_needed to prevent oversized adjustments
-            # Never adjust by more than the primary position size
-            max_adjustment = abs(primary_position) * self.hedge_manager.max_hedge_contracts_multiplier
-            if abs(hedge_needed) > max_adjustment:
-                logger.error(
-                    f"🚨 CRITICAL: Hedge adjustment ({hedge_needed}) exceeds max adjustment ({max_adjustment}). "
-                    f"CAPPING adjustment to {max_adjustment} contracts."
-                )
-                hedge_needed = max_adjustment if hedge_needed > 0 else -max_adjustment
-            
-            # Additional safety: Never adjust by more than primary position itself
-            if abs(hedge_needed) > abs(primary_position):
-                logger.error(
-                    f"🚨 CRITICAL: Hedge adjustment ({hedge_needed}) exceeds primary position ({primary_position}). "
-                    f"CAPPING to primary position size."
-                )
-                hedge_needed = abs(primary_position) if hedge_needed > 0 else -abs(primary_position)
-            
-            # Final safety check: Ensure total hedge position (after adjustment) never exceeds primary
-            # This prevents accumulation of oversized hedges
-            projected_total_hedge = abs(existing_hedge_position + hedge_needed)
-            max_allowed_hedge = abs(primary_position) * self.hedge_manager.max_hedge_contracts_multiplier
-            
-            if projected_total_hedge > max_allowed_hedge:
-                # Calculate maximum allowed adjustment
-                max_allowed_adjustment = max_allowed_hedge - abs(existing_hedge_position)
-                if max_allowed_adjustment < 0:
-                    max_allowed_adjustment = 0  # Already over-hedged, don't add more
+            logger.info(
+                f"Hedge adjustment: primary={primary_position}, "
+                f"existing_hedge={existing_hedge_position}, "
+                f"target_hedge={target_hedge_size}, "
+                f"hedge_needed={hedge_size} (capped), "
+                f"projected_total={abs(existing_hedge_position + hedge_size)}"
+            )
+        else:
+            logger.debug(
+                f"Hedge already adequate: primary={primary_position}, "
+                f"existing_hedge={existing_hedge_position}, "
+                f"target_hedge={target_hedge_size}"
+            )
+        
+        if hedge_size != 0:
+            # CRITICAL: Check total position size limit (50k challenge: 5 contracts max)
+            if hasattr(self, 'max_position_size') and self.max_position_size:
+                primary_pos = abs(self.position_manager.get_net_position(self.primary_symbol))
+                existing_hedge_pos = abs(self.position_manager.get_net_position(self.hedge_symbol))
+                projected_hedge_pos = abs(existing_hedge_position + hedge_size)
+                projected_total = primary_pos + projected_hedge_pos
+                risk_reducing_hedge = self._is_risk_reducing_hedge(primary_position, hedge_size)
                 
-                logger.error(
-                    f"🚨 CRITICAL: Projected total hedge ({projected_total_hedge}) exceeds max ({max_allowed_hedge}). "
-                    f"Limiting adjustment to {max_allowed_adjustment} contracts."
-                )
-                # Cap the adjustment to keep total hedge within limits
-                hedge_needed = max_allowed_adjustment if hedge_needed > 0 else -max_allowed_adjustment
-            
-            # Only place order if we need to adjust the hedge
-            hedge_size = 0  # Default: no hedge order needed
-            if abs(hedge_needed) > 0:
-                # Limit the order size to what's actually needed
-                # Never place an order larger than the difference
-                hedge_size = hedge_needed
-                
-                logger.info(
-                    f"Hedge adjustment: primary={primary_position}, "
-                    f"existing_hedge={existing_hedge_position}, "
-                    f"target_hedge={target_hedge_size}, "
-                    f"hedge_needed={hedge_size} (capped), "
-                    f"projected_total={abs(existing_hedge_position + hedge_size)}"
-                )
-            else:
-                logger.debug(
-                    f"Hedge already adequate: primary={primary_position}, "
-                    f"existing_hedge={existing_hedge_position}, "
-                    f"target_hedge={target_hedge_size}"
-                )
-            
-            if hedge_size != 0:
-                # CRITICAL: Check total position size limit (50k challenge: 5 contracts max)
-                if hasattr(self, 'max_position_size') and self.max_position_size:
-                    primary_pos = abs(self.position_manager.get_net_position(self.primary_symbol))
-                    existing_hedge_pos = abs(self.position_manager.get_net_position(self.hedge_symbol))
-                    projected_hedge_pos = abs(existing_hedge_position + hedge_size)
-                    projected_total = primary_pos + projected_hedge_pos
-                    
-                    if projected_total > self.max_position_size:
+                if projected_total > self.max_position_size:
+                    if not risk_reducing_hedge:
                         logger.error(
                             f"🚨 CRITICAL: Hedge order would exceed position limit: "
                             f"{projected_total} > {self.max_position_size}. "
                             f"Primary: {primary_pos}, Projected Hedge: {projected_hedge_pos}. "
-                            f"Skipping hedge order."
+                            f"Skipping hedge order (not risk-reducing)."
                         )
-                        return  # Don't place hedge if it would exceed limit
+                        return  # Don't place non-risk-reducing hedge if it would exceed limit
+                    logger.warning(
+                        f"⚠️ Allowing risk-reducing hedge beyond position cap: "
+                        f"projected_total={projected_total} > limit={self.max_position_size}. "
+                        f"Primary={primary_position}, hedge_adjustment={hedge_size}."
+                    )
+            
+            # Place hedge order (opposite direction)
+            # hedge_size is negative when we want to go short (SELL)
+            # hedge_size is positive when we want to go long (BUY)
+            hedge_side = "SELL" if hedge_size < 0 else "BUY"
+            order_id = self.order_client.place_limit_order(
+                contract_id=self.hedge_contract_id,
+                side=hedge_side,
+                quantity=abs(hedge_size),
+                price=self.hedge_price or self.current_price  # Use market price for hedge
+            )
+            
+            if order_id:
+                logger.info(f"Placed hedge order: {hedge_side} {abs(hedge_size)} {self.hedge_symbol}")
+                MetricsExporter.record_order(self.hedge_symbol, hedge_side, "placed")
+                self._hedge_cooldown_until = datetime.now() + timedelta(seconds=hedge_cooldown_seconds)
                 
-                # Place hedge order (opposite direction)
-                # hedge_size is negative when we want to go short (SELL)
-                # hedge_size is positive when we want to go long (BUY)
-                hedge_side = "SELL" if hedge_size < 0 else "BUY"
-                order_id = self.order_client.place_limit_order(
-                    contract_id=self.hedge_contract_id,
-                    side=hedge_side,
-                    quantity=abs(hedge_size),
-                    price=self.hedge_price or self.current_price  # Use market price for hedge
-                )
-                
-                if order_id:
-                    logger.info(f"Placed hedge order: {hedge_side} {abs(hedge_size)} {self.hedge_symbol}")
-                    MetricsExporter.record_order(self.hedge_symbol, hedge_side, "placed")
-                    
-                    # Record hedge decision for analytics
-                    self.analytics_store.record_strategy_decision(
-                        decision_type="hedge_placed",
+                # Record hedge decision for analytics
+                self.analytics_store.record_strategy_decision(
+                    decision_type="hedge_placed",
                         symbol=self.hedge_symbol,
                         decision_data={
                             "order_id": str(order_id),
@@ -1015,7 +1392,10 @@ class GridStrategy:
                             "price": self.hedge_price or self.current_price,
                             "primary_position": primary_position,
                             "net_exposure": net_exposure,
-                            "hedge_ratio": self.hedge_manager.hedge_ratio
+                            "hedge_ratio": self.hedge_manager.hedge_ratio,
+                            "trend_strength": getattr(self, '_last_trend_strength', None),
+                            "hedge_fraction": hedge_fraction,
+                            "trend_factor": trend_factor
                         },
                         market_conditions={
                             "atr": getattr(self, '_last_atr', None),
@@ -1034,27 +1414,47 @@ class GridStrategy:
         if not self.api_client.account_id:
             return
         
+        # Poll fills at controlled cadence to reduce API rate-limit pressure.
+        if self._last_fill_poll and (datetime.now() - self._last_fill_poll).total_seconds() < 2:
+            return
+        self._last_fill_poll = datetime.now()
+        
         # Get open orders first (more efficient for checking fills)
         # Also get recent orders to catch any fills that might have happened
         open_orders = self.api_client.get_open_orders(self.api_client.account_id)
         
         # Get recent orders from last hour to check for fills
-        from datetime import timedelta
         recent_orders = self.api_client.get_orders(
             self.api_client.account_id,
-            start_timestamp=datetime.now() - timedelta(hours=1)
+            start_timestamp=datetime.now() - timedelta(minutes=15)
         )
         
         # Combine and deduplicate
         all_orders_dict = {order.get('id'): order for order in open_orders + recent_orders}
         all_orders = list(all_orders_dict.values())
         
+        # Prime status cache on first run to avoid replaying historical fills
+        if not self._fill_tracking_initialized:
+            for order in all_orders:
+                order_id = order.get('id') or order.get('orderId')
+                if order_id:
+                    self._order_status_cache[str(order_id)] = order.get('status')
+            self._fill_tracking_initialized = True
+            logger.info(f"Initialized fill tracking cache for {len(self._order_status_cache)} orders")
+            return
+        
         for order in all_orders:
             order_id = order.get('id') or order.get('orderId')
             status = order.get('status')  # 1=Open, 2=Filled, 3=Cancelled, etc.
+            if not order_id:
+                continue
             
-            # Check if filled (status 2 = Filled)
-            if status == 2:
+            order_id_str = str(order_id)
+            prev_status = self._order_status_cache.get(order_id_str)
+            self._order_status_cache[order_id_str] = status
+            
+            # Process only newly-filled orders (state transition into status 2)
+            if status == 2 and prev_status != 2:
                 # Process fill
                 contract_id = order.get('contractId')
                 side = "BUY" if order.get('side') == 0 else "SELL"  # 0=Bid (buy), 1=Ask (sell)
@@ -1062,6 +1462,24 @@ class GridStrategy:
                 price = order.get('filledPrice') or order.get('limitPrice')
                 
                 if order_id and contract_id and quantity and price:
+                    fill_timestamp = (
+                        order.get('filledTimestamp') or
+                        order.get('updatedTimestamp') or
+                        order.get('modified') or
+                        order.get('timestamp') or
+                        ""
+                    )
+                    fill_key = f"{order_id_str}:{side}:{quantity}:{price}:{fill_timestamp}"
+                    if fill_key in self._processed_fill_keys:
+                        logger.debug(f"Skipping duplicate fill: {fill_key}")
+                        continue
+                    
+                    self._processed_fill_keys.add(fill_key)
+                    self._processed_fill_queue.append(fill_key)
+                    if len(self._processed_fill_queue) > self._processed_fill_cache_limit:
+                        expired_key = self._processed_fill_queue.popleft()
+                        self._processed_fill_keys.discard(expired_key)
+                    
                     # Map contract_id to symbol (simplified - you might want a mapping)
                     symbol = self.primary_symbol if contract_id == self.primary_contract_id else (
                         self.hedge_symbol if contract_id == self.hedge_contract_id else contract_id
@@ -1074,11 +1492,12 @@ class GridStrategy:
                     
                     # Process fill
                     self.fill_handler.on_fill(
-                        order_id=str(order_id),
+                        order_id=order_id_str,
                         symbol=symbol,
                         side=side,
                         quantity=quantity,
-                        price=price
+                        price=price,
+                        fill_id=str(order.get('fillId') or order.get('id') or order.get('orderId'))
                     )
                     MetricsExporter.record_trade(symbol, side)
                     
@@ -1442,7 +1861,7 @@ class GridStrategy:
             # Try to get latest quote from API
             # Note: TopstepX API might have a quote endpoint, but for now we'll use
             # the last price from recent bars or positions
-            if not self.current_price and self.primary_contract_id:
+            if self.primary_contract_id:
                 # Get most recent bar
                 bars = self.api_client.get_bars(
                     contract_id=self.primary_contract_id,
@@ -1453,8 +1872,7 @@ class GridStrategy:
                     last_bar = bars[0]
                     close_price = last_bar.get('c') or last_bar.get('close')
                     if close_price:
-                        self.current_price = float(close_price)
-                        self.position_manager.update_price(self.primary_symbol, self.current_price)
+                        self._update_primary_price(float(close_price))
                         logger.debug(f"Polled {self.primary_symbol} price: {self.current_price:.2f}")
         except Exception as e:
             logger.debug(f"Error polling price update: {e}")
@@ -1570,18 +1988,23 @@ class GridStrategy:
                     time.sleep(1)
                     continue
                 
-                # Check if time to recalculate
-                if datetime.now() - self.last_recalc_time >= self.recalc_interval:
-                    self._recalculate_indicators()
-                    self.last_recalc_time = datetime.now()
+                # Recalculate indicators every cycle for volatility-scaled spacing
+                # This ensures grid spacing is always up-to-date with current volatility
+                self._recalculate_indicators()
+                self.last_recalc_time = datetime.now()
                 
                 # Process fills
                 self._process_fills()
                 
-                # Place grid orders
+                # Enforce hard position limits before any further trading actions
+                if self._enforce_position_limits():
+                    time.sleep(1)
+                    continue
+                
+                # Place grid orders (uses fresh volatility-scaled spacing from above)
                 self._place_grid_orders()
                 
-                # Check and place hedge
+                # Check and place hedge (uses fresh correlation/volatility from above)
                 self._check_and_place_hedge()
                 
                 # Risk checks
@@ -1637,8 +2060,8 @@ class GridStrategy:
                     
                     self.last_state_save = datetime.now()
                 
-                # Fallback: Poll for price updates if SignalR not available
-                if not self.current_price:
+                # Fallback: Poll for price updates if SignalR is missing or stale
+                if not self._is_price_fresh(self.primary_symbol):
                     self._poll_price_update()
                 
                 # Sleep

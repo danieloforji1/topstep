@@ -5,8 +5,12 @@ Enforces hard stops: daily loss guard, trailing drawdown guard, emergency flatte
 import logging
 from typing import Optional
 from datetime import datetime, date
+import pytz
 
 logger = logging.getLogger(__name__)
+
+# Chicago timezone for trading day calculations
+CHICAGO_TZ = pytz.timezone('America/Chicago')
 
 
 class RiskManager:
@@ -22,40 +26,59 @@ class RiskManager:
         self.trailing_drawdown_limit = trailing_drawdown_limit
         self.max_net_notional = max_net_notional
         
-        self.peak_balance: float = 0.0
-        self.current_balance: float = 0.0
-        self.daily_start_balance: float = 0.0
+        # Use equity instead of balance for accurate intraday tracking
+        self.peak_equity: float = 0.0
+        self.current_equity: float = 0.0
+        self.daily_start_equity: float = 0.0
         self.last_reset_date: Optional[date] = None
+        
+        # Keep balance for backward compatibility if needed
+        self.current_balance: float = 0.0
         
         self.hard_stop_triggered: bool = False
         self.hard_stop_reason: Optional[str] = None
     
     def reset_daily(self):
-        """Reset daily tracking (call at start of trading day)"""
-        today = date.today()
+        """Reset daily tracking (call at start of trading day) - uses Chicago timezone"""
+        # Get current date in Chicago timezone (trading day)
+        now_chicago = datetime.now(CHICAGO_TZ)
+        today = now_chicago.date()
+        
         if self.last_reset_date != today:
-            self.daily_start_balance = self.current_balance
+            self.daily_start_equity = self.current_equity
             self.last_reset_date = today
-            logger.info(f"Daily reset: starting balance = ${self.daily_start_balance:.2f}")
+            logger.info(f"Daily reset (Chicago timezone): starting equity = ${self.daily_start_equity:.2f}")
     
     def update_balance(self, balance: float):
-        """Update current balance"""
+        """Update current balance (kept for backward compatibility)"""
         self.current_balance = balance
+        # Also update equity if not set separately
+        if self.current_equity == 0.0:
+            self.current_equity = balance
+            self.peak_equity = balance
+            self.daily_start_equity = balance
         
-        # Update peak balance
-        if balance > self.peak_balance:
-            self.peak_balance = balance
+        # Reset daily if needed
+        self.reset_daily()
+    
+    def update_equity(self, equity: float):
+        """Update current equity (preferred method - includes unrealized P&L)"""
+        self.current_equity = equity
+        
+        # Update peak equity
+        if equity > self.peak_equity:
+            self.peak_equity = equity
         
         # Reset daily if needed
         self.reset_daily()
     
     def get_daily_pnl(self) -> float:
-        """Get today's P&L"""
-        return self.current_balance - self.daily_start_balance
+        """Get today's P&L (based on equity, not balance)"""
+        return self.current_equity - self.daily_start_equity
     
     def get_trailing_drawdown(self) -> float:
-        """Get trailing drawdown from peak"""
-        return self.peak_balance - self.current_balance
+        """Get trailing drawdown from peak equity"""
+        return self.peak_equity - self.current_equity
     
     def daily_loss_exceeded(self) -> bool:
         """Check if daily loss limit exceeded"""
@@ -113,9 +136,13 @@ class RiskManager:
             self.hard_stop_reason = reason
             return True, reason
         
-        # Check exposure cap (warning, not a hard stop)
+        # Check exposure cap (HARD STOP - was previously only a warning)
         if net_exposure >= self.max_net_notional:
-            logger.warning(f"Exposure cap reached: ${net_exposure:.2f}")
+            reason = f"Exposure cap exceeded: ${net_exposure:.2f} >= ${self.max_net_notional:.2f}"
+            self.hard_stop_triggered = True
+            self.hard_stop_reason = reason
+            logger.critical(reason)
+            return True, reason
         
         return False, None
     

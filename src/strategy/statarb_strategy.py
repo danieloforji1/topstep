@@ -52,6 +52,10 @@ class StatArbPosition:
     is_long_spread: bool  # True = long GC, short MGC
     order_id_gc: Optional[str] = None
     order_id_mgc: Optional[str] = None
+    remaining_gc: Optional[int] = None
+    remaining_mgc: Optional[int] = None
+    partial_taken: bool = False
+    best_spread: Optional[float] = None
 
 
 class StatArbStrategy:
@@ -94,6 +98,14 @@ class StatArbStrategy:
             tick_values={
                 self.symbol_a: GC_SPECS.tick_value,
                 self.symbol_b: MGC_SPECS.tick_value
+            },
+            tick_sizes={
+                self.symbol_a: GC_SPECS.tick_size,
+                self.symbol_b: MGC_SPECS.tick_size
+            },
+            contract_multipliers={
+                self.symbol_a: 100.0,  # GC = 100 oz per contract
+                self.symbol_b: 10.0   # MGC = 10 oz per contract
             }
         )
         
@@ -113,11 +125,23 @@ class StatArbStrategy:
         )
         
         # Strategy parameters
-        self.spread_stop_std = self.config.get('spread_stop_std', 3.0)
+        self.spread_stop_std = self.config.get('spread_stop_std', 1.5)
         self.time_stop_hours = self.config.get('time_stop_hours', 2.0)
         self.risk_per_trade = self.config.get('risk_per_trade', 100.0)
         self.recalc_interval = timedelta(seconds=self.config.get('recalc_interval_seconds', 30))
         self.spread_divergence_hours = self.config.get('spread_divergence_hours', 4.0)
+        self.partial_profit_z = self.config.get('partial_profit_z', 1.0)
+        self.partial_profit_fraction = self.config.get('partial_profit_fraction', 0.5)
+        self.trailing_stop_std = self.config.get('trailing_stop_std', 1.0)
+        
+        # Dynamic position sizing parameters
+        self.dynamic_sizing_enabled = self.config.get('dynamic_sizing_enabled', True)
+        self.max_risk_multiplier = self.config.get('max_risk_multiplier', 5.0)  # Max 5x intended risk
+        self.min_risk_multiplier = self.config.get('min_risk_multiplier', 0.3)  # Min 0.3x intended risk
+        self.volatility_stop_adjustment = self.config.get('volatility_stop_adjustment', True)
+        self.high_volatility_threshold = self.config.get('high_volatility_threshold', 10.0)  # $10 spread std
+        self.high_volatility_stop_std = self.config.get('high_volatility_stop_std', 1.0)  # Tighter stop in high vol
+        self.max_contracts_gc = self.config.get('max_contracts_gc', 3)  # Maximum GC contracts per trade
         
         # Execution
         self.order_client = OrderClient(self.api_client, dry_run=self.dry_run)
@@ -132,6 +156,12 @@ class StatArbStrategy:
         self.current_position: Optional[StatArbPosition] = None
         self.last_recalc_time = datetime.now(timezone.utc)
         self.data_lock = Lock()  # Thread-safe access to price data
+        
+        # Track pending entry orders to prevent multiple simultaneous entries
+        self.pending_entry_orders: set = set()  # Set of order IDs for pending entry orders
+        
+        # Track order details for fill handling (order_id -> (symbol, side, quantity))
+        self.order_details: Dict[str, Tuple[str, str, int]] = {}
         
         # Historical data for calculations (pandas DataFrames)
         self.df_gc: Optional[pd.DataFrame] = None
@@ -158,6 +188,7 @@ class StatArbStrategy:
         
         # Get accounts
         accounts = self.api_client.get_accounts()
+        print(f"Accounts response: {accounts}")
         if not accounts:
             logger.error("No accounts found")
             return False
@@ -276,16 +307,22 @@ class StatArbStrategy:
         logger.info("Loading historical data for spread calculation...")
         
         # Fetch bars for both instruments
+        # Use smaller limit to avoid timeout - API will return what's available
+        # Statarb needs ~1440 bars (1 day of 1m bars), but request more to account for gaps
+        requested_limit = 2000
+        actual_limit = min(requested_limit, 1500)  # Reduce to avoid timeout
+        
+        logger.info(f"Fetching historical bars (limit={actual_limit}, may take longer for large requests)...")
         bars_gc = self.api_client.get_bars(
             contract_id=self.contract_id_a,
             interval="1m",
-            limit=2000  # Enough for spread history
+            limit=actual_limit  # Enough for spread history
         )
         
         bars_mgc = self.api_client.get_bars(
             contract_id=self.contract_id_b,
             interval="1m",
-            limit=2000
+            limit=actual_limit
         )
         
         if bars_gc and bars_mgc:
@@ -481,33 +518,160 @@ class StatArbStrategy:
         entry_price_b: float,
         stop_spread: float,
         beta: float,
-        is_long_spread: bool
+        is_long_spread: bool,
+        spread_std: Optional[float] = None,
+        entry_spread: Optional[float] = None
     ) -> Tuple[int, int]:
-        """Calculate position sizes for both legs"""
-        # Calculate entry spread
-        entry_spread = entry_price_a - beta * entry_price_b
+        """
+        Calculate position sizes dynamically based on risk per trade and stop distance.
         
-        # Calculate spread move that would hit stop
-        spread_move_at_stop = abs(entry_spread - stop_spread)
+        Args:
+            entry_price_a: GC entry price
+            entry_price_b: MGC entry price
+            stop_spread: Stop loss spread level
+            beta: Hedge ratio
+            is_long_spread: True if long spread
+            spread_std: Standard deviation of spread (for volatility-based adjustments)
+            entry_spread: Entry spread value (for calculating stop distance)
         
-        if spread_move_at_stop == 0:
-            return 1, 10  # Default: 1 GC, 10 MGC
+        Returns:
+            (contracts_gc, contracts_mgc) maintaining 1:10 ratio
+        """
+        # If dynamic sizing disabled, use fixed sizing
+        if not self.dynamic_sizing_enabled:
+            contracts_gc = 1
+            contracts_mgc = 10
+            logger.debug("Dynamic sizing disabled, using fixed: 1 GC, 10 MGC")
+            return contracts_gc, contracts_mgc
         
-        # Risk per spread point: approximately $100 (from GC leg)
-        risk_per_spread_point = 100.0
-        total_risk = spread_move_at_stop * risk_per_spread_point
+        # Calculate entry spread if not provided
+        if entry_spread is None:
+            entry_spread = entry_price_a - beta * entry_price_b
         
-        if total_risk == 0:
+        # Calculate stop distance (how far spread can move before stop loss)
+        stop_distance = abs(entry_spread - stop_spread)
+        
+        if stop_distance == 0:
+            logger.warning("Stop distance is 0, using minimum position size")
             return 1, 10
         
-        # Calculate number of GC contracts
-        contracts_gc = max(1, int(self.risk_per_trade / total_risk))
-        contracts_gc = min(contracts_gc, 2)  # Cap at 2 (reduced from 10 for risk management)
+        # Volatility-based stop adjustment
+        effective_stop_std = self.spread_stop_std
+        if self.volatility_stop_adjustment and spread_std is not None:
+            if spread_std > self.high_volatility_threshold:
+                # High volatility: use tighter stop
+                effective_stop_std = self.high_volatility_stop_std
+                logger.info(
+                    f"High volatility detected (spread_std=${spread_std:.2f}), "
+                    f"using tighter stop: {effective_stop_std} std (normal: {self.spread_stop_std})"
+                )
+                # Recalculate stop_distance with adjusted stop_std
+                if is_long_spread:
+                    adjusted_stop_spread = entry_spread - effective_stop_std * spread_std
+                else:
+                    adjusted_stop_spread = entry_spread + effective_stop_std * spread_std
+                stop_distance = abs(entry_spread - adjusted_stop_spread)
         
-        # Hedge with MGC: 1 GC contract = 10 MGC contracts
-        contracts_mgc = max(1, contracts_gc * 10)
+        # Calculate risk per GC contract
+        # For spread trade: if spread moves by stop_distance, GC moves approximately by that amount
+        # GC contract = 100 oz, so risk = stop_distance × 100 oz
+        risk_per_gc_contract = stop_distance * 100.0  # 100 oz per GC contract
+        
+        if risk_per_gc_contract <= 0:
+            logger.warning("Risk per contract is 0 or negative, using minimum position size")
+            return 1, 10
+        
+        # Calculate contracts needed to match risk_per_trade
+        contracts_gc = int(self.risk_per_trade / risk_per_gc_contract)
+        
+        # Enforce minimum (can't trade 0 contracts)
+        contracts_gc = max(1, contracts_gc)
+        
+        # Enforce maximum (hard cap at 2 GC / 10 MGC for safety)
+        contracts_gc = min(contracts_gc, self.max_contracts_gc)
+        contracts_gc = min(contracts_gc, 2)  # Hard cap at 2 GC
+        
+        # Maintain 1:10 hedge ratio
+        contracts_mgc = contracts_gc * 10
+        contracts_mgc = min(contracts_mgc, 10)  # Hard cap at 10 MGC (maintains 1:10 ratio)
+        
+        # Calculate actual risk
+        actual_risk = risk_per_gc_contract * contracts_gc
+        risk_multiplier = actual_risk / self.risk_per_trade
+        
+        # Check if risk is too high
+        if risk_multiplier > self.max_risk_multiplier:
+            logger.warning(
+                f"⚠️ Calculated risk (${actual_risk:.2f}) exceeds max multiplier "
+                f"({self.max_risk_multiplier}x = ${self.risk_per_trade * self.max_risk_multiplier:.2f}). "
+                f"Using minimum position size to limit risk."
+            )
+            # Use minimum size to limit risk
+            contracts_gc = 1
+            contracts_mgc = 10
+            actual_risk = risk_per_gc_contract * contracts_gc
+            risk_multiplier = actual_risk / self.risk_per_trade
+        
+        # Log position sizing details
+        spread_std_str = f"{spread_std:.2f}" if spread_std is not None else "N/A"
+        logger.info(
+            f"📊 Dynamic Position Sizing: "
+            f"stop_distance=${stop_distance:.2f}, "
+            f"spread_std=${spread_std_str}, "
+            f"risk_per_contract=${risk_per_gc_contract:.2f}, "
+            f"contracts_gc={contracts_gc}, contracts_mgc={contracts_mgc}, "
+            f"actual_risk=${actual_risk:.2f} ({risk_multiplier:.2f}x intended ${self.risk_per_trade:.2f})"
+        )
+        
+        # Warn if risk is significantly different from intended
+        if risk_multiplier > 2.0:
+            logger.warning(
+                f"⚠️ Actual risk (${actual_risk:.2f}) is {risk_multiplier:.2f}x intended "
+                f"(${self.risk_per_trade:.2f}) due to contract minimums. "
+                f"Consider tighter stops or skipping high-volatility trades."
+            )
+        elif risk_multiplier < self.min_risk_multiplier:
+            logger.info(
+                f"ℹ️ Actual risk (${actual_risk:.2f}) is {risk_multiplier:.2f}x intended "
+                f"(${self.risk_per_trade:.2f}). Could use more contracts, but at minimum size."
+            )
         
         return contracts_gc, contracts_mgc
+    
+    def _check_order_rejected(self, order_id: str, symbol: str) -> bool:
+        """
+        Check if an order was immediately rejected after placement.
+        Returns True if order is rejected, False otherwise.
+        """
+        if not order_id or self.dry_run:
+            return False
+        
+        try:
+            # Get recent orders to check status
+            recent_orders = self.api_client.get_orders(
+                self.api_client.account_id,
+                start_timestamp=datetime.now(timezone.utc) - timedelta(minutes=5)
+            )
+            
+            for order in recent_orders:
+                order_id_str = str(order.get('id') or order.get('orderId', ''))
+                if order_id_str == str(order_id):
+                    status = order.get('status')
+                    # Status 4 = Rejected
+                    if status == 4:
+                        rejection_reason = order.get('rejectionReason') or order.get('reason') or order.get('message') or 'Unknown'
+                        logger.warning(
+                            f"⚠️ {symbol} order {order_id} was rejected: {rejection_reason}"
+                        )
+                        return True
+                    # Status 2 = Filled, 1 = Pending, 3 = Cancelled (but not rejected)
+                    return False
+            
+            # Order not found in recent orders - might still be pending
+            return False
+        except Exception as e:
+            logger.debug(f"Error checking order status for {symbol} order {order_id}: {e}")
+            return False
     
     def _check_spread_divergence(self, signal: SpreadSignal) -> bool:
         """
@@ -559,23 +723,36 @@ class StatArbStrategy:
     
     def _enter_spread_position(self, signal: SpreadSignal) -> bool:
         """Enter a spread position (both legs simultaneously)"""
+        # Check if we already have a position
         if self.current_position:
             logger.warning("Already in a position, cannot enter new one")
             return False
         
-        # Calculate position sizes
+        # Calculate stop spread (will be adjusted if volatility-based adjustment is enabled)
         stop_spread = signal.spread_mean + (
             -self.spread_stop_std * signal.spread_std if signal.signal == "LONG_SPREAD"
             else self.spread_stop_std * signal.spread_std
         )
         
+        # Calculate position sizes with dynamic sizing
         contracts_gc, contracts_mgc = self._calculate_position_size(
             signal.price_a,
             signal.price_b,
             stop_spread,
             signal.beta,
-            signal.signal == "LONG_SPREAD"
+            signal.signal == "LONG_SPREAD",
+            spread_std=signal.spread_std,
+            entry_spread=signal.spread
         )
+        
+        # If dynamic sizing returned 0 contracts (risk too high), skip this trade
+        if contracts_gc == 0 or contracts_mgc == 0:
+            logger.warning(
+                f"❌ Position sizing returned 0 contracts - risk too high. "
+                f"Skipping trade. spread_std=${signal.spread_std:.2f}, "
+                f"stop_distance would be ${abs(signal.spread - stop_spread):.2f}"
+            )
+            return False
         
         # Determine order sides
         if signal.signal == "LONG_SPREAD":
@@ -605,6 +782,55 @@ class StatArbStrategy:
             price=order_price_mgc
         )
         
+        # Check if orders were immediately rejected (e.g., "Trading is not available for this instrument")
+        if order_id_gc and not self.dry_run:
+            gc_rejected = self._check_order_rejected(order_id_gc, "GC")
+            if gc_rejected:
+                logger.error(
+                    f"❌ GC order {order_id_gc} was rejected immediately. "
+                    f"GC trading may not be available on this account. Skipping spread trade."
+                )
+                if order_id_mgc:
+                    self.order_client.cancel_order(order_id_mgc)
+                return False
+        
+        if order_id_mgc and not self.dry_run:
+            mgc_rejected = self._check_order_rejected(order_id_mgc, "MGC")
+            if mgc_rejected:
+                logger.error(
+                    f"❌ MGC order {order_id_mgc} was rejected immediately. "
+                    f"Not enough margin or trading not available. Skipping spread trade."
+                )
+                if order_id_gc:
+                    self.order_client.cancel_order(order_id_gc)
+                return False
+        
+        # CRITICAL: For spread trades, BOTH legs must be placed successfully
+        # If one fails, cancel the other to prevent unhedged positions
+        if not order_id_gc or not order_id_mgc:
+            # One or both orders failed - cancel any that succeeded
+            if order_id_gc:
+                logger.warning(f"GC order placed but MGC order failed - cancelling GC order {order_id_gc}")
+                self.order_client.cancel_order(order_id_gc)
+            if order_id_mgc:
+                logger.warning(f"MGC order placed but GC order failed - cancelling MGC order {order_id_mgc}")
+                self.order_client.cancel_order(order_id_mgc)
+            logger.error(
+                f"❌ SPREAD ENTRY FAILED: Both legs must be placed. "
+                f"GC order: {'SUCCESS' if order_id_gc else 'FAILED'}, "
+                f"MGC order: {'SUCCESS' if order_id_mgc else 'FAILED'}"
+            )
+            return False
+        
+        # Both orders placed successfully - track them
+        order_id_gc_str = str(order_id_gc)
+        order_id_mgc_str = str(order_id_mgc)
+        self.pending_entry_orders.add(order_id_gc_str)
+        self.pending_entry_orders.add(order_id_mgc_str)
+        self.order_details[order_id_gc_str] = (self.symbol_a, side_gc, contracts_gc)
+        self.order_details[order_id_mgc_str] = (self.symbol_b, side_mgc, contracts_mgc)
+        
+        # Create position only if BOTH orders were placed successfully
         if order_id_gc and order_id_mgc:
             # Create position - ensure timezone-aware datetime
             if hasattr(signal.timestamp, 'to_pydatetime'):
@@ -619,8 +845,8 @@ class StatArbStrategy:
             
             self.current_position = StatArbPosition(
                 entry_time=entry_time,
-                entry_price_gc=order_price_gc,
-                entry_price_mgc=order_price_mgc,
+                entry_price_gc=order_price_gc if order_id_gc else signal.price_a,
+                entry_price_mgc=order_price_mgc if order_id_mgc else signal.price_b,
                 entry_spread=signal.spread,
                 entry_zscore=signal.zscore,
                 beta=signal.beta,
@@ -630,21 +856,21 @@ class StatArbStrategy:
                 order_id_gc=order_id_gc,
                 order_id_mgc=order_id_mgc
             )
+            self.current_position.remaining_gc = contracts_gc
+            self.current_position.remaining_mgc = contracts_mgc
+            self.current_position.partial_taken = False
+            self.current_position.best_spread = signal.spread
             
             logger.info(
-                f"PLACED ORDERS for {signal.signal} at z={signal.zscore:.2f} | "
+                f"✅ PLACED BOTH ORDERS for {signal.signal} at z={signal.zscore:.2f} | "
                 f"GC: {side_gc} {contracts_gc} @ {order_price_gc:.2f} (order: {order_id_gc}) | "
                 f"MGC: {side_mgc} {contracts_mgc} @ {order_price_mgc:.2f} (order: {order_id_mgc}) | "
                 f"Spread={signal.spread:.2f}"
             )
             return True
         else:
-            logger.error(f"Failed to place orders: GC={order_id_gc}, MGC={order_id_mgc}")
-            # Cancel any partial orders
-            if order_id_gc:
-                self.order_client.cancel_order(order_id_gc)
-            if order_id_mgc:
-                self.order_client.cancel_order(order_id_mgc)
+            # This should never happen now (we return False above), but keep as safety
+            logger.error(f"Failed to create position: GC={order_id_gc}, MGC={order_id_mgc}")
             return False
     
     def _exit_spread_position(self, exit_reason: str) -> bool:
@@ -653,6 +879,11 @@ class StatArbStrategy:
             return False
         
         pos = self.current_position
+        remaining_gc = pos.remaining_gc if pos.remaining_gc is not None else pos.contracts_gc
+        remaining_mgc = pos.remaining_mgc if pos.remaining_mgc is not None else pos.contracts_mgc
+        if remaining_gc <= 0 or remaining_mgc <= 0:
+            logger.warning("No remaining contracts to exit")
+            return False
         
         # Determine exit sides (opposite of entry)
         if pos.is_long_spread:
@@ -671,31 +902,127 @@ class StatArbStrategy:
         exit_order_gc = self.order_client.place_limit_order(
             contract_id=self.contract_id_a,
             side=side_gc,
-            quantity=pos.contracts_gc,
+            quantity=remaining_gc,
             price=exit_price_gc
         )
         
         exit_order_mgc = self.order_client.place_limit_order(
             contract_id=self.contract_id_b,
             side=side_mgc,
-            quantity=pos.contracts_mgc,
+            quantity=remaining_mgc,
             price=exit_price_mgc
         )
+        
+        # Track exit orders for fill handling
+        if exit_order_gc:
+            exit_order_gc_str = str(exit_order_gc)
+            self.order_details[exit_order_gc_str] = (self.symbol_a, side_gc, remaining_gc)
+        if exit_order_mgc:
+            exit_order_mgc_str = str(exit_order_mgc)
+            self.order_details[exit_order_mgc_str] = (self.symbol_b, side_mgc, remaining_mgc)
         
         if exit_order_gc and exit_order_mgc:
             logger.info(
                 f"PLACED EXIT ORDERS: {exit_reason} | "
-                f"GC: {side_gc} {pos.contracts_gc} @ {exit_price_gc:.2f} | "
-                f"MGC: {side_mgc} {pos.contracts_mgc} @ {exit_price_mgc:.2f}"
+                f"GC: {side_gc} {remaining_gc} @ {exit_price_gc:.2f} | "
+                f"MGC: {side_mgc} {remaining_mgc} @ {exit_price_mgc:.2f}"
             )
+            pos.remaining_gc = 0
+            pos.remaining_mgc = 0
             return True
         else:
             logger.error(f"Failed to place exit orders: GC={exit_order_gc}, MGC={exit_order_mgc}")
             return False
+
+    def _partial_exit_position(self, exit_reason: str, fraction: float) -> bool:
+        """Exit part of the current spread position (close both legs proportionally)"""
+        if not self.current_position:
+            return False
+        
+        pos = self.current_position
+        remaining_gc = pos.remaining_gc if pos.remaining_gc is not None else pos.contracts_gc
+        remaining_mgc = pos.remaining_mgc if pos.remaining_mgc is not None else pos.contracts_mgc
+        
+        if remaining_gc <= 1:
+            logger.debug("Partial exit skipped: only 1 GC contract remaining")
+            return False
+        
+        fraction = max(0.1, min(0.9, fraction))
+        partial_gc = max(1, int(remaining_gc * fraction))
+        partial_mgc = max(1, int(remaining_mgc * fraction))
+        
+        # Ensure we leave at least 1 GC and 10 MGC (hedge ratio) remaining
+        if remaining_gc - partial_gc < 1:
+            partial_gc = remaining_gc - 1
+        if remaining_mgc - partial_mgc < 10:
+            partial_mgc = remaining_mgc - 10
+        
+        if partial_gc <= 0 or partial_mgc <= 0:
+            logger.debug("Partial exit skipped: not enough contracts to reduce")
+            return False
+        
+        # Determine exit sides (opposite of entry)
+        if pos.is_long_spread:
+            side_gc = "SELL"
+            side_mgc = "BUY"
+        else:
+            side_gc = "BUY"
+            side_mgc = "SELL"
+        
+        # Get current prices
+        with self.data_lock:
+            exit_price_gc = self.current_price_a or pos.entry_price_gc
+            exit_price_mgc = self.current_price_b or pos.entry_price_mgc
+        
+        # Place partial exit orders
+        exit_order_gc = self.order_client.place_limit_order(
+            contract_id=self.contract_id_a,
+            side=side_gc,
+            quantity=partial_gc,
+            price=exit_price_gc
+        )
+        
+        exit_order_mgc = self.order_client.place_limit_order(
+            contract_id=self.contract_id_b,
+            side=side_mgc,
+            quantity=partial_mgc,
+            price=exit_price_mgc
+        )
+        
+        # Track exit orders for fill handling
+        if exit_order_gc:
+            exit_order_gc_str = str(exit_order_gc)
+            self.order_details[exit_order_gc_str] = (self.symbol_a, side_gc, partial_gc)
+        if exit_order_mgc:
+            exit_order_mgc_str = str(exit_order_mgc)
+            self.order_details[exit_order_mgc_str] = (self.symbol_b, side_mgc, partial_mgc)
+        
+        if exit_order_gc and exit_order_mgc:
+            pos.remaining_gc = remaining_gc - partial_gc
+            pos.remaining_mgc = remaining_mgc - partial_mgc
+            pos.partial_taken = True
+            logger.info(
+                f"PARTIAL EXIT: {exit_reason} | "
+                f"GC: {side_gc} {partial_gc} @ {exit_price_gc:.2f} | "
+                f"MGC: {side_mgc} {partial_mgc} @ {exit_price_mgc:.2f} | "
+                f"Remaining GC={pos.remaining_gc}, MGC={pos.remaining_mgc}"
+            )
+            return True
+        
+        logger.error(f"Failed to place partial exit orders: GC={exit_order_gc}, MGC={exit_order_mgc}")
+        return False
     
     def _check_exit_conditions(self) -> Tuple[bool, str]:
         """Check if current position should be exited"""
         if not self.current_position:
+            return False, ""
+        
+        # CRITICAL: Don't check exit conditions if entry orders haven't been filled yet
+        # This prevents premature exits that clear the position before it's actually entered
+        if self.pending_entry_orders:
+            logger.debug(
+                f"Exit check skipped: entry orders still pending ({len(self.pending_entry_orders)} orders)"
+            )
             return False, ""
         
         pos = self.current_position
@@ -742,6 +1069,32 @@ class StatArbStrategy:
             current_spread,
             spread_history
         )
+
+        # Track best favorable spread for trailing stop
+        if pos.best_spread is None:
+            pos.best_spread = current_spread
+        else:
+            if pos.is_long_spread and current_spread > pos.best_spread:
+                pos.best_spread = current_spread
+            elif not pos.is_long_spread and current_spread < pos.best_spread:
+                pos.best_spread = current_spread
+        
+        # Partial profit taking (only if we have enough size)
+        if not pos.partial_taken and abs(current_zscore) <= self.partial_profit_z:
+            if self._partial_exit_position("PARTIAL_PROFIT", self.partial_profit_fraction):
+                # Reset best spread to start trailing from the partial profit level
+                pos.best_spread = current_spread
+            return False, ""
+        
+        # Trailing stop after partial profit
+        if pos.partial_taken and spread_std > 0:
+            trail_distance = self.trailing_stop_std * spread_std
+            if pos.is_long_spread:
+                if current_spread <= pos.best_spread - trail_distance:
+                    return True, "TRAILING_SL"
+            else:
+                if current_spread >= pos.best_spread + trail_distance:
+                    return True, "TRAILING_SL"
         
         # Check z-score exit
         if abs(current_zscore) < self.calculator.z_exit:
@@ -767,6 +1120,24 @@ class StatArbStrategy:
     def _check_order_fills(self):
         """Check if pending orders have been filled"""
         if not self.current_position or not self.api_client.account_id:
+            # If no position but we have pending orders, check if they were cancelled/rejected
+            if self.pending_entry_orders and not self.dry_run:
+                # Check recent orders to see if any pending orders were cancelled/rejected
+                try:
+                    recent_orders = self.api_client.get_orders(
+                        self.api_client.account_id,
+                        start_timestamp=datetime.now(timezone.utc) - timedelta(hours=1)
+                    )
+                    for order in recent_orders:
+                        order_id = str(order.get('id') or order.get('orderId', ''))
+                        if order_id in self.pending_entry_orders:
+                            status = order.get('status')
+                            # Status 3 = Cancelled, 4 = Rejected, etc.
+                            if status in [3, 4] or status != 2:  # Not filled
+                                logger.warning(f"Pending order {order_id} was cancelled/rejected, removing from tracking")
+                                self.pending_entry_orders.discard(order_id)
+                except Exception as e:
+                    logger.debug(f"Error checking pending orders status: {e}")
             return
         
         # Get recent orders to check for fills
@@ -775,37 +1146,144 @@ class StatArbStrategy:
             start_timestamp=datetime.now(timezone.utc) - timedelta(hours=1)
         )
         
+        gc_filled = False
+        mgc_filled = False
+        
         for order in recent_orders:
             order_id = str(order.get('id') or order.get('orderId', ''))
-            status = order.get('status')  # 2 = Filled
+            status = order.get('status')  # 2 = Filled, 3 = Cancelled, 4 = Rejected
             
-            if status == 2:
-                # Check if this is one of our position orders
-                if order_id == self.current_position.order_id_gc:
+            # Handle any tracked order (entry or exit) - check order_details first
+            if order_id in self.order_details and status == 2:  # Filled
+                fill_price = order.get('filledPrice') or order.get('limitPrice')
+                if fill_price:
+                    fill_price_float = float(fill_price)
+                    symbol, side, qty = self.order_details[order_id]
+                    # CRITICAL: Notify position manager of fill (works for both entry and exit)
+                    self.position_manager.on_fill(symbol, side, qty, fill_price_float)
+                    logger.info(f"Order filled: {side} {qty} {symbol} @ {fill_price} (order: {order_id})")
+                    # Remove from tracking after fill
+                    self.order_details.pop(order_id, None)
+                    if order_id in self.pending_entry_orders:
+                        self.pending_entry_orders.discard(order_id)
+            
+            # Check if this is one of our position entry orders (for position tracking)
+            if self.current_position and order_id == str(self.current_position.order_id_gc):
+                if status == 2:  # Filled
                     fill_price = order.get('filledPrice') or order.get('limitPrice')
                     if fill_price:
-                        self.current_position.entry_price_gc = float(fill_price)
-                        logger.info(f"GC order filled: {order_id} @ {fill_price}")
-                elif order_id == self.current_position.order_id_mgc:
+                        fill_price_float = float(fill_price)
+                        self.current_position.entry_price_gc = fill_price_float
+                        gc_filled = True
+                        # Remove from pending orders
+                        self.pending_entry_orders.discard(order_id)
+                        # Note: on_fill already called above for all tracked orders
+                        logger.info(f"GC entry order filled: {order_id} @ {fill_price}")
+                elif status in [3, 4]:  # Cancelled or Rejected
+                    logger.warning(f"GC order {order_id} was cancelled/rejected (status: {status})")
+                    self.pending_entry_orders.discard(order_id)
+                    self.order_details.pop(order_id, None)
+                    # CRITICAL: Cancel the other leg to prevent unhedged position
+                    if self.current_position and self.current_position.order_id_mgc:
+                        logger.warning("GC leg cancelled/rejected - cancelling MGC leg to prevent unhedged position")
+                        self.order_client.cancel_order(self.current_position.order_id_mgc)
+                    # Clear position and pending orders
+                    if self.current_position:
+                        logger.warning("One leg cancelled/rejected, clearing position and pending orders")
+                        self.current_position = None
+                        self.pending_entry_orders.clear()
+                        self.order_details.clear()
+            elif order_id == str(self.current_position.order_id_mgc):
+                if status == 2:  # Filled
                     fill_price = order.get('filledPrice') or order.get('limitPrice')
                     if fill_price:
-                        self.current_position.entry_price_mgc = float(fill_price)
+                        fill_price_float = float(fill_price)
+                        self.current_position.entry_price_mgc = fill_price_float
+                        mgc_filled = True
+                        # Remove from pending orders
+                        self.pending_entry_orders.discard(order_id)
+                        # Note: on_fill already called above for all tracked orders
                         # Recalculate entry spread with actual fill prices
                         self.current_position.entry_spread = (
                             self.current_position.entry_price_gc - 
                             self.current_position.beta * self.current_position.entry_price_mgc
                         )
-                        logger.info(f"MGC order filled: {order_id} @ {fill_price}")
+                        logger.info(f"MGC entry order filled: {order_id} @ {fill_price}")
+                elif status in [3, 4]:  # Cancelled or Rejected
+                    logger.warning(f"MGC order {order_id} was cancelled/rejected (status: {status})")
+                    self.pending_entry_orders.discard(order_id)
+                    self.order_details.pop(order_id, None)
+                    # CRITICAL: Cancel the other leg to prevent unhedged position
+                    if self.current_position and self.current_position.order_id_gc:
+                        logger.warning("MGC leg cancelled/rejected - cancelling GC leg to prevent unhedged position")
+                        self.order_client.cancel_order(self.current_position.order_id_gc)
+                    # Clear position and pending orders
+                    if self.current_position:
+                        logger.warning("One leg cancelled/rejected, clearing position and pending orders")
+                        self.current_position = None
+                        self.pending_entry_orders.clear()
+                        self.order_details.clear()
+        
+        # If both orders are filled, clear pending orders set (should already be empty, but ensure it)
+        if gc_filled and mgc_filled:
+            self.pending_entry_orders.clear()
+            # Clean up order details for filled orders
+            if str(self.current_position.order_id_gc) in self.order_details:
+                self.order_details.pop(str(self.current_position.order_id_gc))
+            if str(self.current_position.order_id_mgc) in self.order_details:
+                self.order_details.pop(str(self.current_position.order_id_mgc))
+            logger.info("✅ Both entry orders filled - spread position fully entered")
+        elif gc_filled and not mgc_filled:
+            # GC filled but MGC didn't - check if MGC order still pending or failed
+            if self.current_position and self.current_position.order_id_mgc:
+                mgc_order_id = str(self.current_position.order_id_mgc)
+                # Check if MGC order is still pending (not filled, not cancelled)
+                mgc_order_status = None
+                for order in recent_orders:
+                    if str(order.get('id') or order.get('orderId', '')) == mgc_order_id:
+                        mgc_order_status = order.get('status')
+                        break
+                
+                if mgc_order_status == 2:  # Filled (should have been caught above)
+                    pass  # Will be handled next iteration
+                elif mgc_order_status in [3, 4]:  # Cancelled/Rejected
+                    logger.error("❌ GC filled but MGC was cancelled/rejected - UNHEDGED POSITION! Cancelling GC immediately.")
+                    # Cancel GC position immediately to prevent unhedged exposure
+                    if self.current_position:
+                        self._exit_spread_position("EMERGENCY_UNHEDGED")
+                        self.current_position = None
+                else:
+                    # MGC order still pending - wait a bit, but log warning
+                    logger.warning(f"⚠️ GC filled but MGC order {mgc_order_id} still pending - monitoring...")
+        elif mgc_filled and not gc_filled:
+            # MGC filled but GC didn't - same check
+            if self.current_position and self.current_position.order_id_gc:
+                gc_order_id = str(self.current_position.order_id_gc)
+                gc_order_status = None
+                for order in recent_orders:
+                    if str(order.get('id') or order.get('orderId', '')) == gc_order_id:
+                        gc_order_status = order.get('status')
+                        break
+                
+                if gc_order_status == 2:  # Filled (should have been caught above)
+                    pass  # Will be handled next iteration
+                elif gc_order_status in [3, 4]:  # Cancelled/Rejected
+                    logger.error("❌ MGC filled but GC was cancelled/rejected - UNHEDGED POSITION! Cancelling MGC immediately.")
+                    # Cancel MGC position immediately to prevent unhedged exposure
+                    if self.current_position:
+                        self._exit_spread_position("EMERGENCY_UNHEDGED")
+                        self.current_position = None
+                else:
+                    # GC order still pending - wait a bit, but log warning
+                    logger.warning(f"⚠️ MGC filled but GC order {gc_order_id} still pending - monitoring...")
     
     def _process_tick(self):
         """Process a single tick - called periodically"""
         if self.paused or not self.running:
             return
         
-        # Check risk limits (hard stop check)
-        if self.risk_manager.hard_stop_triggered:
-            logger.warning("Risk limits reached, pausing trading")
-            self.paused = True
+        # Continuous risk checks: enforce daily loss and trailing drawdown limits
+        if self._update_risk_checks():
             return
         
         # Update historical data periodically
@@ -855,28 +1333,53 @@ class StatArbStrategy:
         )
         
         if signal is None:
+            # Log why signal is None for debugging
+            if len(spread_history) < self.calculator.min_lookback:
+                logger.debug(
+                    f"⚠️ No signal: Insufficient spread history. "
+                    f"Have {len(spread_history)} periods, need {self.calculator.min_lookback}"
+                )
+            else:
+                logger.debug(f"⚠️ No signal: process_bar returned None (check data alignment)")
             return
+        
+        # Log signal details for diagnostics
+        logger.info(
+            f"📊 STATARB SIGNAL: spread={signal.spread:.2f}, zscore={signal.zscore:.3f}, "
+            f"beta={signal.beta:.3f}, signal={signal.signal}, "
+            f"is_entry={signal.is_entry}, is_exit={signal.is_exit}, "
+            f"current_pos={current_pos}, z_entry_threshold=±{self.calculator.z_entry}"
+        )
         
         # Handle entry signals (only if no position)
         if signal.is_entry and not self.current_position:
-            # Check spread divergence filter before entering
-            if self._check_spread_divergence(signal):
-                logger.info(
-                    f"Entry blocked by divergence filter: z={signal.zscore:.2f}, "
-                    f"signal={signal.signal}"
-                )
-                return  # Skip entry if divergence filter blocks it
+            logger.info(f"✅ ENTRY SIGNAL TRIGGERED: {signal.signal} (zscore={signal.zscore:.3f})")
             self._enter_spread_position(signal)
+        elif signal.is_entry and self.current_position:
+            logger.debug(f"⏸️ Entry signal ignored: Already in position")
+        elif not signal.is_entry and abs(signal.zscore) < self.calculator.z_entry:
+            logger.debug(
+                f"⏸️ No entry: |zscore|={abs(signal.zscore):.3f} < entry_threshold={self.calculator.z_entry}"
+            )
         
         # Monitor position for exits
-        if self.current_position:
+        # CRITICAL: Only check exit conditions if both entry orders are filled
+        # If there are pending entry orders, we haven't actually entered the position yet
+        if self.current_position and not self.pending_entry_orders:
             should_exit, exit_reason = self._check_exit_conditions()
             if should_exit:
                 self._exit_spread_position(exit_reason)
                 # Clear position after exit and reset divergence tracking
                 self.current_position = None
+                self.pending_entry_orders.clear()  # Clear any pending orders when position is cleared
                 self.extreme_spread_start_time = None
                 self.last_extreme_direction = None
+        elif self.current_position and self.pending_entry_orders:
+            # Position exists but orders not filled yet - wait for fills before checking exits
+            logger.debug(
+                f"Position exists but waiting for entry order fills. "
+                f"Pending orders: {len(self.pending_entry_orders)}"
+            )
     
     def _update_risk_checks(self) -> bool:
         """Update risk checks and return True if should stop"""
@@ -886,7 +1389,8 @@ class StatArbStrategy:
         # Get current exposure
         exposure = self.position_manager.net_exposure_dollars()
         
-        # Update risk manager balance
+        # Update risk manager with equity (preferred) or balance
+        # Equity includes unrealized P&L, which is what we need for accurate risk tracking
         accounts = self.api_client.get_accounts()
         if accounts:
             selected_account = next(
@@ -896,9 +1400,17 @@ class StatArbStrategy:
                 None
             )
             if selected_account:
+                # Try to get equity first (includes unrealized P&L)
+                current_equity = selected_account.get('equity') or selected_account.get('netLiquidation')
                 current_balance = selected_account.get('balance')
-                if current_balance is not None:
-                    self.risk_manager.update_balance(current_balance)
+                
+                if current_equity is not None:
+                    # Use equity (preferred - includes unrealized P&L)
+                    self.risk_manager.update_equity(float(current_equity))
+                elif current_balance is not None:
+                    # Fallback to balance if equity not available
+                    self.risk_manager.update_balance(float(current_balance))
+                    logger.debug("Using balance instead of equity (equity not available from API)")
         
         daily_pnl = self.risk_manager.get_daily_pnl()
         drawdown = self.risk_manager.get_trailing_drawdown()
@@ -926,9 +1438,13 @@ class StatArbStrategy:
             self._exit_spread_position(reason)
             self.current_position = None
         
+        # Clear pending orders tracking
+        self.pending_entry_orders.clear()
+        
         # Close all positions via API
         if not self.dry_run and self.api_client.account_id:
             positions = self.api_client.get_positions(self.api_client.account_id)
+            print(f"Positions response: {positions}")
             for position in positions:
                 contract_id = position.get('contractId')
                 if contract_id:
@@ -989,6 +1505,15 @@ class StatArbStrategy:
                 if self.paused:
                     time.sleep(1)
                     continue
+                
+                # CRITICAL: Reconcile positions with API (source of truth)
+                # This ensures PositionManager knows about actual positions
+                try:
+                    api_positions = self.api_client.get_positions(self.api_client.account_id)
+                    if api_positions:
+                        self.position_manager.reconcile_with_api_positions(api_positions)
+                except Exception as e:
+                    logger.debug(f"Error reconciling positions: {e}")
                 
                 # Check for order fills
                 self._check_order_fills()

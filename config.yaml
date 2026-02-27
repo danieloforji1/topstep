@@ -21,7 +21,9 @@ grid_levels_each_side: 3  # Base number of levels each side (used if adaptive_de
 atr_window: 14         # ATR on 15m candles by default
 atr_multiplier_for_spacing: 0.35  # Slightly wider spacing for challenge (less aggressive)
 profit_ticks_per_leg: 0.40  # multiplier of atr_points
-hedge_activation_multiplier: 1.5  # Slightly higher threshold for hedging
+hedge_activation_multiplier: 0.8  # Lower threshold for faster hedging (was 1.3)
+hedge_profit_protection_enabled: true  # Hedge earlier when profitable
+hedge_profit_protection_threshold: 50.0  # Hedge when unrealized P&L > $50 and price moves against
 
 # Enhanced Grid Features
 adaptive_density: true  # Enable adaptive grid density based on volatility
@@ -44,13 +46,14 @@ order_flow_volume_threshold: 0.1  # Minimum volume threshold to avoid price leve
 
 # Volatility & Sizing
 volatility_window: 100  # for sizer and corr calc
-sizer_R_per_trade: 100  # Reduced risk per trade ($100 vs $150) for challenge safety
-max_net_notional: 800  # Reduced exposure cap to respect 5-contract limit
+sizer_R_per_trade: 25  # Reduced risk per trade ($100 vs $150) for challenge safety
+max_net_notional: 15000000  # Updated: With correct multiplier (5x), 5 MES @ $7000 = $175k notional. Set to $200k for headroom.
 max_position_size: 5    # Hard limit: 5 contracts max (challenge requirement)
 
 # Timing
 recalc_interval_seconds: 60  # Slightly less frequent recalc for challenge
 session_close_safety_margin_minutes: 10  # More conservative margin (challenge safety)
+max_price_staleness_seconds: 5  # Skip order/hedge actions if market price is stale
 
 # TopstepX API Configuration
 api_base_url: https://api.topstepx.com
@@ -60,8 +63,16 @@ market_hub_url: https://rtc.topstepx.com/hubs/market
 # Risk Management
 hedge_ratio_min: 0.4   # Lower minimum for challenge (less aggressive)
 hedge_ratio_max: 1.0    # Lower maximum for challenge (safer)
-correlation_threshold: 0.65  # Higher threshold (more conservative)
+correlation_threshold: 0.60  # Higher threshold (more conservative)
 max_hedge_contracts_multiplier: 0.5  # Conservative hedge sizing (50% of primary max)
+hedge_min_exposure_dollars: 300  # Minimum exposure before hedging
+hedge_unwind_multiplier: 0.5  # Unwind hedge when price is within 0.5x spacing
+hedge_cooldown_seconds: 60  # Reduced cooldown for faster response (was 120)
+hedge_fraction_of_primary: 0.7  # More aggressive hedge (70% of target, was 50%)
+hedge_max_fraction_of_primary: 1.0  # Cap hedge at 100% of primary size
+hedge_trend_threshold: 2.0  # Trend strength in ATRs to reduce hedging
+hedge_trend_reduce_factor: 0.3  # Reduce hedge size in strong trends
+trend_window: 20  # Window for trend strength calculation
 
 # Consistency Target (challenge requirement)
 # Best day cannot exceed 50% of total profits

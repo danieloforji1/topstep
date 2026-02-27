@@ -1,0 +1,541 @@
+PRD — Topstep $50K Combine: MES–M2K Bounded Spread Grid + Dynamic Hedge (TopstepX API)
+0) Objective
+
+Build an automated strategy that trades MES vs M2K using a bounded, time-boxed spread grid with a dynamic hedge ratio, integrated with TopstepX API (ProjectX Gateway) for:
+
+market data (streaming)
+
+order placement / cancels / OCO
+
+account + positions + PnL
+
+safety/risk lockouts
+
+Topstep constraints to explicitly honor:
+
+Maximum Loss Limit (MLL) on $50K = $2,000 trailing from the account balance high (end-of-day logic; the minimum balance line does not drop back down after profits).
+
+Daily Loss Limit (DLL): if exceeded, account is auto-liquidated and locked for the rest of the trading day (order attempts rejected) and you can trade again at 5 PM CT next day.
+(Topstep also states DLL hits are no longer “account-loss” by themselves, but the lockout still kills the day and can cascade into MLL if unmanaged.)
+
+TopstepX API access supports executing trades, monitoring P&L, balances, OCO, canceling, etc.
+
+1) Non-goals
+
+No martingale / “add forever”
+
+No holding through macro announcements
+
+No assumption of stationarity across weeks/months
+
+No “always on” behavior: system must often do nothing
+
+2) Strategy Summary (what we trade)
+2.1 Define the spread (stationarized)
+
+Use a rolling hedge ratio β(t) estimated intraday:
+
+Compute returns on mid-prices (or last) for MES and M2K
+
+Estimate β(t) (rolling OLS of M2K returns on MES returns)
+
+Clamp β to safe bounds (configurable)
+
+Define spread:
+
+𝑆
+(
+𝑡
+)
+=
+𝑃
+𝑀
+2
+𝐾
+(
+𝑡
+)
+−
+𝛽
+(
+𝑡
+)
+⋅
+𝑃
+𝑀
+𝐸
+𝑆
+(
+𝑡
+)
+S(t)=P
+M2K
+	​
+
+(t)−β(t)⋅P
+MES
+	​
+
+(t)
+
+Standardize spread:
+
+𝑍
+(
+𝑡
+)
+=
+𝑆
+(
+𝑡
+)
+−
+𝜇
+𝑆
+𝜎
+𝑆
+Z(t)=
+σ
+S
+	​
+
+S(t)−μ
+S
+	​
+
+	​
+
+
+with rolling μ/σ computed over a configurable window.
+
+2.2 Trade logic
+
+When |Z| reaches discrete “grid levels”, open a paired position sized by β(t)
+
+Exit quickly on partial reversion
+
+If reversion doesn’t begin quickly, exit by time stop
+
+Hard cap inventory (layers + contracts)
+
+2.3 Key design constraint
+
+Grid is on the spread signal, not on leg prices.
+We never “grid both legs independently”.
+
+3) Topstep Risk & Compliance Requirements
+3.1 MLL engine (must be correct for $50K Combine)
+
+Maintain equity_high_watermark (end-of-day high watermark per Topstep’s description of MLL behavior)
+
+MLL floor for $50K Combine:
+MLL_floor = equity_high_watermark - 2000
+
+Strategy must enforce an internal safety buffer:
+
+MLL_buffer_dollars (e.g., $250–$500)
+
+If projected equity under worst-case fill would breach buffer → flatten + lock
+
+3.2 DLL engine (intraday lockout prevention)
+
+Track intraday realized + unrealized + fees estimate
+
+If PnL approaches DLL threshold minus buffer:
+
+emergency flatten (marketable)
+
+transition to LOCKED state for the rest of the day
+(Topstep will auto-liquidate when exceeded; we aim to avoid hitting it.)
+
+3.3 “Stop trading when green”
+
+For Combine pass-rate and MLL survival, the system must support:
+
+daily_profit_target (conservative)
+
+when reached → stop entering new trades for the day
+
+3.4 Trade window restrictions
+
+System must support disabling trading:
+
+first N minutes after session open
+
+last N minutes before session close
+
+macro “no-trade windows” (manual calendar config)
+
+4) System Architecture
+4.1 Components
+
+Market Data Service
+
+subscribes MES, M2K
+
+maintains rolling bars + tick buffers
+
+Signal Engine
+
+β(t) estimator
+
+spread S(t)
+
+Z-score
+
+regime filters
+
+Strategy Engine
+
+grid-layer manager
+
+entry/exit rules
+
+time stops
+
+LIFO unwinds
+
+Risk Governor (Topstep Guardrails)
+
+DLL guard (intraday)
+
+MLL guard (trailing)
+
+max inventory
+
+kill switches
+
+Execution Layer (TopstepX API via ProjectX)
+
+order placement (limit/market)
+
+OCO/brackets
+
+cancel/replace
+
+position & PnL reconciliation
+
+Telemetry + Journal
+
+structured logs (JSON)
+
+daily summary report
+
+replay artifacts
+
+4.2 State machine (explicit)
+
+States:
+
+WARMUP (no trading until enough data for β and σ)
+
+RISK_OFF (filters fail; manage only)
+
+RISK_ON (filters pass; can enter)
+
+MANAGE_ONLY (no new entries; only exits)
+
+FLATTEN (emergency exit)
+
+LOCKED (DLL/MLL proximity or daily target reached)
+
+ERROR (data/API failure; flatten and stop)
+
+5) TopstepX API Integration Requirements
+5.1 API choice
+
+Use ProjectX Gateway API (TopstepX runs on it)
+
+Implementation can use:
+
+direct HTTP + realtime hubs, or
+
+a Python SDK such as project-x-py (recommended for speed of implementation)
+
+5.2 Realtime endpoints (must support)
+
+From project-x-py docs (TopstepX defaults):
+
+user hub URL: https://rtc.topstepx.com/hubs/user
+
+market hub URL: https://rtc.topstepx.com/hubs/market
+
+5.3 Capabilities required
+
+Subscribe: MES, M2K quotes (and optionally depth)
+
+Get: account balance, positions, realized/unrealized PnL
+
+Place/cancel orders; OCO/brackets supported
+
+Robust reconnect logic; sequence handling
+
+5.4 API safety requirements
+
+If market data stream stalls > X seconds → FLATTEN + LOCKED
+
+If order rejected N times → FLATTEN + ERROR
+
+Reconcile positions every Y seconds (pull + compare vs local)
+
+6) Strategy Details (Codex must implement exactly)
+6.1 Data & calculations
+
+Bars
+
+Build 1-second (or 5-second) internal bars from ticks
+
+Also maintain 1-minute bars for β estimation stability
+
+β estimation
+
+Window: configurable (default 60 minutes of 1m returns)
+
+Compute OLS slope:
+
+β = Cov(rMES, rM2K) / Var(rMES)
+
+Clamp β in [beta_min, beta_max] (defaults conservative)
+
+Update β at most once per minute
+
+Spread stats
+
+Rolling μ and σ of S(t) on a window (default 120 minutes)
+
+If σ is too small → disable trading (avoid division noise)
+
+6.2 Regime filters (must all pass)
+
+Correlation filter: corr(rMES, rM2K) >= corr_min
+
+Trend filter: if MES trend strength above threshold → risk-off
+(implementation options: ADX, EMA slope, or simple directional persistence)
+
+Volatility shock filter: if recent realized vol > threshold → risk-off
+
+Time-of-day filter: only trade in configured windows
+
+6.3 Grid definition (on Z)
+
+Config:
+
+entry_levels: e.g. [1.2, 1.7] (absolute Z)
+
+max_layers: 2 (hard cap)
+
+max_abs_z: 2.2 (beyond this, no new entries)
+
+reentry_cooldown_sec: prevents rapid-fire churn
+
+Entry rule
+If Z >= entry_level[k] and layer k not open:
+
+Enter “short spread”:
+
+SELL M2K
+
+BUY MES in hedge size
+
+If Z <= -entry_level[k]:
+
+Enter “long spread”:
+
+BUY M2K
+
+SELL MES in hedge size
+
+Sizing rule (micro contracts)
+
+Base MES size per layer: mes_units_per_layer (default 1)
+
+M2K size: round(beta * mes_units_per_layer * size_scale)
+
+Must honor contract limits and internal risk caps
+
+6.4 Exits (fast realization)
+
+For each open layer:
+
+Take-profit: close when |Z| <= z_takeprofit OR when Z crosses back past z_mid threshold
+
+Stop: close when |Z| >= z_stop (tight)
+
+Time stop: close if layer age > max_hold_seconds
+
+Unwind order
+
+LIFO: close newest layer first
+
+6.5 Emergency behavior
+
+If Z breaches max_abs_z OR filters fail sharply:
+
+transition MANAGE_ONLY
+
+optionally close all layers at market if risk increases
+
+7) Risk Governor (the “don’t blow accounts” module)
+7.1 Internal risk budgets
+
+Codex must implement configurable budgets:
+
+max_gross_contracts_mes
+
+max_gross_contracts_m2k
+
+max_layers
+
+max_daily_trades
+
+max_daily_entries
+
+7.2 DLL guard
+
+Inputs:
+
+dll_amount (Topstep config; you will set from the Combine dashboard)
+
+dll_buffer (e.g., $150–$300)
+Logic:
+
+intraday_pnl = realized_today + unrealized_now - fees_estimate
+
+If intraday_pnl <= -(dll_amount - dll_buffer):
+
+flatten all
+
+lock until reset time (5 PM CT per Topstep article)
+
+7.3 MLL guard ($50K fixed drawdown distance)
+
+Track equity_high_watermark
+
+Compute mll_floor = equity_high_watermark - 2000
+
+Use buffer mll_buffer:
+
+If equity_now <= mll_floor + mll_buffer → flatten + lock
+
+7.4 Daily profit lock
+
+If intraday_pnl >= daily_profit_target:
+
+close positions
+
+lock for day
+
+7.5 Fail-closed rule
+
+If any of these fail:
+
+PnL unavailable
+
+positions desync
+
+market data stale
+Then:
+
+FLATTEN then ERROR
+
+8) Implementation Plan (Cursor tasks)
+Milestone A — Skeleton + Connectivity
+
+Implement configuration system (YAML)
+
+Implement ProjectX/TopstepX auth + realtime market subscription
+
+Implement basic order placement + cancel (paper mode first)
+
+Milestone B — Data pipeline
+
+Build tick store + bar builder
+
+Build rolling stats library (returns, corr, OLS beta, zscore)
+
+Milestone C — Strategy core
+
+Implement state machine
+
+Implement layer manager
+
+Implement entry/exit rules and time stops
+
+Milestone D — Topstep risk governor
+
+Implement MLL/DLL monitors with buffers
+
+Implement emergency flatten + lockouts
+
+Milestone E — Replay/backtest harness
+
+Replay recorded market streams into strategy
+
+Validate invariants: “never breach locks”, “never exceed max layers”, etc.
+
+Milestone F — Observability
+
+JSON logs
+
+Daily summary report:
+
+trades, avg hold time, max open layers, max drawdown, near-breach events
+
+9) Acceptance Tests (must pass)
+
+No Martingale Test
+
+On monotonically worsening Z, system must stop adding layers at max_layers and must not increase per-layer size.
+
+DLL Near-Breach Test
+
+Simulate PnL falling to within buffer → system flattens before DLL, then rejects new orders same day.
+
+MLL Near-Breach Test
+
+Simulate equity close to mll_floor+buffer → system flattens and locks.
+
+Data Stall Test
+
+Freeze market stream → system flattens and locks.
+
+Recovery Test
+
+After lockout resets at next day boundary (5 PM CT), system resumes from WARMUP.
+
+10) What I need from you (so Codex doesn’t guess wrong)
+
+Topstep’s MLL is known ($2,000 for $50K).
+But your DLL number for the $50K Combine can vary by program/version and should be pulled from your dashboard.
+
+So in the config, you will set:
+
+dll_amount = <your displayed DLL>
+
+daily_profit_target = <your preference>
+
+Everything else can be shipped with conservative defaults.
+
+11) Recommended defaults (conservative, Combine-friendly)
+
+(These are starting points, not promises.)
+
+max_layers = 2
+
+entry_levels = [1.3, 1.8]
+
+z_takeprofit = 0.7
+
+z_stop = 2.2
+
+max_hold_seconds = 720 (12 minutes)
+
+mes_units_per_layer = 1
+
+beta clamp = [0.5, 1.5]
+
+dll_buffer = $200
+
+mll_buffer = $350
+
+daily_profit_target = $700

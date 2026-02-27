@@ -80,6 +80,123 @@ class OrderClient:
                     return None
         
         return None
+
+    def place_market_order(
+        self,
+        contract_id: str,
+        side: str,
+        quantity: int,
+        idempotency_key: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Place a market order with idempotency.
+        """
+        if idempotency_key is None:
+            idempotency_key = str(uuid.uuid4())
+
+        if idempotency_key in self.idempotency_keys:
+            existing_order_id = self.idempotency_keys[idempotency_key]
+            logger.debug(f"Order with key {idempotency_key} already exists: {existing_order_id}")
+            return existing_order_id
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = self.api_client.place_order(
+                    contract_id=contract_id,
+                    side=side,
+                    quantity=quantity,
+                    order_type="Market",
+                    price=None
+                )
+
+                if result and (result.get("success", True) or "orderId" in result):
+                    order_id = result.get("orderId") or result.get("id")
+                    if order_id:
+                        self.pending_orders[order_id] = {
+                            "contract_id": contract_id,
+                            "side": side,
+                            "quantity": quantity,
+                            "price": None,
+                            "timestamp": datetime.now(),
+                            "idempotency_key": idempotency_key
+                        }
+                        self.idempotency_keys[idempotency_key] = order_id
+                        logger.info(f"Placed market order: {order_id} - {side} {quantity}")
+                        return order_id
+
+                logger.warning(f"Market order placement returned no order ID: {result}")
+            except Exception as e:
+                logger.error(f"Error placing market order (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    return None
+
+        return None
+    
+    def place_stop_order(
+        self,
+        contract_id: str,
+        side: str,
+        quantity: int,
+        stop_price: float,
+        idempotency_key: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Place a stop order with idempotency.
+        
+        Args:
+            contract_id: Contract ID
+            side: "BUY" or "SELL"
+            quantity: Number of contracts
+            stop_price: Stop price that triggers the order
+            idempotency_key: Optional key to prevent duplicate orders
+        """
+        if idempotency_key is None:
+            idempotency_key = str(uuid.uuid4())
+        
+        if idempotency_key in self.idempotency_keys:
+            existing_order_id = self.idempotency_keys[idempotency_key]
+            logger.debug(f"Order with key {idempotency_key} already exists: {existing_order_id}")
+            return existing_order_id
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = self.api_client.place_order(
+                    contract_id=contract_id,
+                    side=side,
+                    quantity=quantity,
+                    order_type="Stop",
+                    price=None,
+                    stop_price=stop_price
+                )
+                
+                if result and (result.get("success", True) or "orderId" in result):
+                    order_id = result.get("orderId") or result.get("id")
+                    if order_id:
+                        self.pending_orders[order_id] = {
+                            "contract_id": contract_id,
+                            "side": side,
+                            "quantity": quantity,
+                            "stop_price": stop_price,
+                            "timestamp": datetime.now(),
+                            "idempotency_key": idempotency_key
+                        }
+                        self.idempotency_keys[idempotency_key] = order_id
+                        logger.info(f"Placed stop order: {order_id} - {side} {quantity} @ stop {stop_price:.2f}")
+                        return order_id
+                
+                logger.warning(f"Stop order placement returned no order ID: {result}")
+            except Exception as e:
+                logger.error(f"Error placing stop order (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    return None
+        
+        return None
     
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order"""
